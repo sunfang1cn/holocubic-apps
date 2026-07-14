@@ -6,6 +6,7 @@ function M.new(cfg, load_module)
   local Audio = load_module("audio")
   local Protocol = load_module("protocol")
   local Activation = load_module("activation")
+  local Mcp = load_module("mcp")
 
   local self = {
     cfg = cfg,
@@ -14,6 +15,7 @@ function M.new(cfg, load_module)
     audio = nil,
     protocol = nil,
     activation = nil,
+    mcp = nil,
     timer = nil,
     wake_open_timer = nil,
     listening_mode = State.LISTEN_AUTO,
@@ -247,6 +249,11 @@ function M.new(cfg, load_module)
     self.protocol:on("alert", function(status, message, emotion)
       alert(status, message, emotion)
     end)
+    self.protocol:on("mcp", function(payload)
+      if self.mcp then
+        self.mcp:handle(payload)
+      end
+    end)
   end
 
   local function bind_audio()
@@ -395,6 +402,11 @@ function M.new(cfg, load_module)
     self.ui:setup()
     self.audio = Audio.new(cfg)
     self.protocol = Protocol.new(cfg)
+    self.mcp = Mcp.new(cfg, function(payload)
+      return self.protocol:send_mcp_message(payload)
+    end, function()
+      if self.stop then self.stop("mcp app switch") end
+    end)
     bind_audio()
     bind_protocol()
     self.state:on_change(on_state_changed)

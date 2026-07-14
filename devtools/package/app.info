@@ -4,4 +4,4 @@ kind = service
 allow_webui = true
 autostart_service = true
 description = Developer tools service
-version = 1.0.0
+version = 1.0.1

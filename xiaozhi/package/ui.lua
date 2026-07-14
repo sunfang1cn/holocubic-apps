@@ -4,12 +4,14 @@ local SEL_MAIN = (rawget(_G, "LV_PART_MAIN") or 0) | (rawget(_G, "LV_STATE_DEFAU
 local LV_LABEL_LONG_CLIP = rawget(_G, "LV_LABEL_LONG_CLIP") or 1
 local LV_LABEL_LONG_WRAP = rawget(_G, "LV_LABEL_LONG_WRAP") or LV_LABEL_LONG_CLIP
 local LV_LABEL_LONG_SCROLL_CIRCULAR = rawget(_G, "LV_LABEL_LONG_SCROLL_CIRCULAR") or LV_LABEL_LONG_CLIP
+local LV_TEXT_ALIGN_LEFT = rawget(_G, "LV_TEXT_ALIGN_LEFT") or 0
 local LV_TEXT_ALIGN_CENTER = rawget(_G, "LV_TEXT_ALIGN_CENTER") or 1
 local LV_IMG_SIZE_MODE_REAL = rawget(_G, "LV_IMG_SIZE_MODE_REAL") or 0
 local LV_OBJ_FLAG_SCROLLABLE = rawget(_G, "LV_OBJ_FLAG_SCROLLABLE") or 0
 local LV_OBJ_FLAG_HIDDEN = rawget(_G, "LV_OBJ_FLAG_HIDDEN") or 0
 local LV_DIR_VER = rawget(_G, "LV_DIR_VER") or 0
 local LV_ANIM_ON = rawget(_G, "LV_ANIM_ON") or 1
+local LV_ANIM_OFF = rawget(_G, "LV_ANIM_OFF") or 0
 local lv_obj_has_flag_fn = rawget(_G, "lv_obj_has_flag")
 
 -- 官方默认 LCD 深色主题：纯黑背景、白色文字。
@@ -33,6 +35,73 @@ local function text_or(value, fallback)
     return fallback or ""
   end
   return text
+end
+
+local function utf8_char(cp)
+  if cp < 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+    return nil
+  end
+  if cp <= 0x7F then
+    return string.char(cp)
+  elseif cp <= 0x7FF then
+    return string.char(
+      0xC0 + math.floor(cp / 0x40),
+      0x80 + (cp % 0x40)
+    )
+  elseif cp <= 0xFFFF then
+    return string.char(
+      0xE0 + math.floor(cp / 0x1000),
+      0x80 + (math.floor(cp / 0x40) % 0x40),
+      0x80 + (cp % 0x40)
+    )
+  end
+  return string.char(
+    0xF0 + math.floor(cp / 0x40000),
+    0x80 + (math.floor(cp / 0x1000) % 0x40),
+    0x80 + (math.floor(cp / 0x40) % 0x40),
+    0x80 + (cp % 0x40)
+  )
+end
+
+local function decode_unicode_escapes(value)
+  local text = text_or(value, "")
+  if not string.find(text, "\\u", 1, true) then
+    return text
+  end
+
+  local out = {}
+  local i = 1
+  while i <= #text do
+    if string.sub(text, i, i + 1) == "\\u" then
+      local hex = string.sub(text, i + 2, i + 5)
+      local cp = tonumber(hex, 16)
+      if cp then
+        local used = 6
+        if cp >= 0xD800 and cp <= 0xDBFF and string.sub(text, i + 6, i + 7) == "\\u" then
+          local low = tonumber(string.sub(text, i + 8, i + 11), 16)
+          if low and low >= 0xDC00 and low <= 0xDFFF then
+            cp = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
+            used = 12
+          end
+        end
+        local ch = utf8_char(cp)
+        if ch then
+          out[#out + 1] = ch
+          i = i + used
+        else
+          out[#out + 1] = string.sub(text, i, i + used - 1)
+          i = i + used
+        end
+      else
+        out[#out + 1] = string.sub(text, i, i)
+        i = i + 1
+      end
+    else
+      out[#out + 1] = string.sub(text, i, i)
+      i = i + 1
+    end
+  end
+  return table.concat(out)
 end
 
 local function path_exists(path)
@@ -178,29 +247,75 @@ local function set_hidden(id, hidden)
   end
 end
 
-local function utf8_len(text)
-  text = text_or(text, "")
-  local count = 0
-  for i = 1, #text do
+local function text_units(text)
+  local units = {}
+  local i = 1
+  while i <= #text do
     local b = string.byte(text, i)
-    if b < 0x80 or b >= 0xC0 then
-      count = count + 1
+    local size = 1
+    if b >= 0xF0 then
+      size = 4
+    elseif b >= 0xE0 then
+      size = 3
+    elseif b >= 0xC0 then
+      size = 2
     end
+    local ch = string.sub(text, i, i + size - 1)
+    local width = 16
+    if b < 0x80 then
+      if ch == "\t" then
+        width = 16
+      elseif string.find("ilI1.,:;!'|`", ch, 1, true) then
+        width = 5
+      elseif string.find("MWmw@#%&", ch, 1, true) then
+        width = 13
+      else
+        width = 9
+      end
+    end
+    units[#units + 1] = { text = ch, width = width }
+    i = i + size
   end
-  return count
+  return units
 end
 
-local function bubble_size(text, max_w, min_w)
-  local chars = utf8_len(text)
-  local has_wide = #text > chars
-  local unit_w = has_wide and 14 or 8
-  local width = math.max(min_w or 44, math.min(max_w, chars * unit_w + 24))
-  local per_line = math.max(1, math.floor((width - 18) / unit_w))
-  local lines = math.ceil(math.max(chars, 1) / per_line)
-  if lines > 3 then
-    lines = 3
+-- LVGL 的 Lua 绑定没有可靠的文本测量接口。这里用当前 16px 字体的保守宽度
+-- 预先换行，让气泡尺寸、实际标签行数和滚动内容高度始终保持一致。
+local function bubble_layout(text, max_w, min_w)
+  text = text_or(text, ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  local natural_w = 0
+  local line_w = 0
+  for _, unit in ipairs(text_units(text)) do
+    if unit.text == "\n" then
+      natural_w = math.max(natural_w, line_w)
+      line_w = 0
+    else
+      line_w = line_w + unit.width
+    end
   end
-  return width, 14 + lines * 18
+  natural_w = math.max(natural_w, line_w)
+
+  local width = math.max(min_w or 44, math.min(max_w, natural_w + 18))
+  local content_w = math.max(8, width - 18)
+  local out = {}
+  local lines = 1
+  line_w = 0
+  for _, unit in ipairs(text_units(text)) do
+    if unit.text == "\n" then
+      out[#out + 1] = "\n"
+      lines = lines + 1
+      line_w = 0
+    else
+      if line_w > 0 and line_w + unit.width > content_w then
+        out[#out + 1] = "\n"
+        lines = lines + 1
+        line_w = 0
+      end
+      out[#out + 1] = unit.text
+      line_w = line_w + unit.width
+    end
+  end
+  return width, 14 + lines * 20, table.concat(out)
 end
 
 local emotion_alias = {
@@ -628,7 +743,9 @@ function M.new(cfg)
     text_font = nil,
     ui = {},
     messages = {},
-    view_mode = "default",
+    -- nil forces setup() to apply the configured layout instead of treating
+    -- the default value as if the layout had already been initialized.
+    view_mode = nil,
     last_state = "",
     last_status = "正在初始化",
     last_status_ms = 0,
@@ -664,7 +781,10 @@ function M.new(cfg)
   local function draw_bubble(role, content, y)
     local max_w = role == "system" and 236 or 230
     local min_w = role == "system" and 52 or 48
-    local w, h = bubble_size(content, max_w, min_w)
+    local w, content_h, wrapped = bubble_layout(content, max_w, min_w)
+    -- 上下各留 10px，保证任何单个气泡都不会高于 212px 的聊天视口。
+    -- 超出的文字保留完整高度，由气泡自身提供纵向滚动。
+    local h = math.min(content_h, 192)
     local x = 12
     local bg = C.assistant
     if role == "user" then
@@ -680,10 +800,16 @@ function M.new(cfg)
     lv_obj_set_size(bubble, w, h)
     style_round(bubble, bg, 8)
 
-    local txt = label(bubble, 9, 7, w - 18, h - 12, content, C.text,
-      LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_WRAP)
-    if role ~= "system" and lv_obj_set_style_text_align then
-      lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_CENTER, SEL_MAIN)
+    local txt = label(bubble, 9, 7, w - 18, content_h - 12, wrapped, C.text,
+      LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_WRAP)
+    if lv_obj_set_style_text_align then
+      lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_LEFT, SEL_MAIN)
+    end
+    if content_h > h then
+      enable_scroll_y(bubble)
+      if lv_obj_scroll_to_y then
+        pcall(function() lv_obj_scroll_to_y(bubble, 0, LV_ANIM_OFF) end)
+      end
     end
     return bubble, h
   end
@@ -693,20 +819,40 @@ function M.new(cfg)
     if not self.ui.chat_area or not lv_obj_clean then
       return
     end
+    -- 列表使用绝对坐标重建；重建完成并定位到底部前先隐藏视口，避免
+    -- 尚未应用新滚动量的气泡短暂绘制在物理屏幕范围之外。
+    set_hidden(self.ui.chat_area, true)
+    -- 重建前清掉旧的视口偏移，避免新气泡沿用旧坐标原点而出现在屏幕外。
+    if lv_obj_scroll_to_y then
+      pcall(function() lv_obj_scroll_to_y(self.ui.chat_area, 0, LV_ANIM_OFF) end)
+    end
     pcall(function()
       lv_obj_clean(self.ui.chat_area)
     end)
     local y = 10
     local last = nil
+    local last_bottom = 0
     for _, item in ipairs(self.messages) do
       local bubble, h = draw_bubble(item.role, item.content, y)
       last = bubble
+      last_bottom = y + h
       y = y + h + 8
     end
-    if last and lv_obj_scroll_to_view_recursive then
-      pcall(function()
-        lv_obj_scroll_to_view_recursive(last, LV_ANIM_ON)
-      end)
+    if last then
+      -- 先更新内容边界，再滚到经过钳制的底部位置。避免重建后的旧滚动量
+      -- 叠加，以及最后一个气泡超出一屏时递归滚动产生过冲。
+      if lv_obj_update_layout then
+        pcall(function() lv_obj_update_layout(self.ui.chat_area) end)
+      end
+      local bottom = math.max(0, last_bottom + 10 - 212)
+      if lv_obj_scroll_to_y then
+        pcall(function() lv_obj_scroll_to_y(self.ui.chat_area, bottom, LV_ANIM_OFF) end)
+      elseif lv_obj_scroll_to_view_recursive then
+        pcall(function() lv_obj_scroll_to_view_recursive(last, LV_ANIM_ON) end)
+      end
+    end
+    if self.view_mode == "wechat" then
+      set_hidden(self.ui.chat_area, false)
     end
   end
 
@@ -733,7 +879,7 @@ function M.new(cfg)
     end
   end
 
-  -- 更新顶部居中的状态文字；通知显示时会临时覆盖它。
+  -- 更新顶部左侧状态文字；通知显示时会临时覆盖它。
   function self:set_status(status)
     self.last_status = text_or(status, "")
     self.last_status_ms = now_ms()
@@ -859,7 +1005,7 @@ function M.new(cfg)
   -- 默认模式显示底部字幕；微信模式保存最近 20 条并重绘气泡。
   function self:set_chat_message(role, content)
     self.last_role = text_or(role, "system")
-    self.last_message = text_or(content, "")
+    self.last_message = decode_unicode_escapes(content)
     append_message(self.last_role, self.last_message)
     set_label(self.ui.chat, self.last_message)
     set_hidden(self.ui.bottom_bar, self.view_mode ~= "default" or self.last_message == "")
@@ -1001,7 +1147,7 @@ function M.new(cfg)
     lv_obj_set_size(self.ui.top_bar, 320, 28)
     style_rect(self.ui.top_bar, C.bg, 128, false)
 
-    self.ui.net = label(self.ui.top_bar, 12, 6, 52, 16, "", C.text)
+    self.ui.net = label(self.ui.top_bar, 270, 6, 38, 16, "", C.text)
     self.ui.audio = label(self.ui.top_bar, 232, 6, 34, 16, "", C.text)
     self.ui.wake = label(self.ui.top_bar, 270, 6, 38, 16, "", C.text)
 
@@ -1009,13 +1155,15 @@ function M.new(cfg)
     lv_obj_set_pos(self.ui.status_bar, 0, 0)
     lv_obj_set_size(self.ui.status_bar, 320, 28)
     style_transparent(self.ui.status_bar)
-    self.ui.notify = label(self.ui.status_bar, 32, 5, 256, 18, "", C.text)
-    self.ui.status = label(self.ui.status_bar, 32, 5, 256, 18, self.last_status,
-      C.text, LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_SCROLL_CIRCULAR)
+    self.ui.notify = label(self.ui.status_bar, 12, 5, 248, 18, "", C.text,
+      LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_CLIP)
+    self.ui.status = label(self.ui.status_bar, 12, 5, 248, 18, self.last_status,
+      C.text, LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_CLIP)
     set_hidden(self.ui.notify, true)
 
     self:set_emotion("neutral")
-    self:set_view_mode("default", true)
+    local configured_style = self.cfg and (self.cfg.DEFAULT_UI_STYLE or self.cfg.default_ui_style) or "default"
+    self:set_view_mode(configured_style, true)
     self:update_status_bar(true)
     return true
   end

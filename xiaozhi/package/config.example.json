@@ -9,8 +9,15 @@
   "websocket": {
     "url": "",
     "token": "",
-    "version": 3
+    "version": 1
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "frame_duration": 60,
+    "bitrate": 12000
   },
   "wake_word": "你好小智",
-  "timezone": "CST-8"
+  "timezone": "CST-8",
+  "default_ui_style": "default"
 }

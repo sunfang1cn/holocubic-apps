@@ -99,10 +99,84 @@ local function parse_response(raw)
   return out
 end
 
+local function read_runtime_config(path)
+  if not file or not file.getcontents or not sjson or not sjson.decode then
+    return nil
+  end
+  local ok, raw = pcall(function()
+    return file.getcontents(path)
+  end)
+  if not ok or type(raw) ~= "string" or raw == "" then
+    return nil
+  end
+  local decoded, obj = pcall(sjson.decode, raw)
+  if decoded and type(obj) == "table" then
+    return obj
+  end
+  return nil
+end
+
+local function default_runtime_config(cfg)
+  return {
+    ota = {
+      url = cfg.ota and cfg.ota.url or "",
+      enabled = not (cfg.ota and cfg.ota.enabled == false),
+      force = cfg.ota and cfg.ota.force == true or false,
+      interval_ms = cfg.ota and cfg.ota.interval_ms or 3000,
+      max_polls = cfg.ota and cfg.ota.max_polls or 80,
+      timeout_ms = cfg.ota and cfg.ota.timeout_ms or 10000,
+    },
+    websocket = {
+      url = cfg.websocket and cfg.websocket.url or "",
+      token = cfg.websocket and cfg.websocket.token or "",
+      version = cfg.websocket and cfg.websocket.version or 1,
+    },
+    audio = {
+      sample_rate = cfg.AUDIO and cfg.AUDIO.rate or 16000,
+      channels = cfg.AUDIO and cfg.AUDIO.channels or 1,
+      frame_duration = cfg.AUDIO and cfg.AUDIO.frame_ms or 60,
+      bitrate = cfg.AUDIO and cfg.AUDIO.bitrate or 12000,
+    },
+    wake_word = cfg.WAKE_WORD or "你好小智",
+    timezone = cfg.TIMEZONE or "CST-8",
+    default_ui_style = cfg.DEFAULT_UI_STYLE or "default",
+  }
+end
+
 local function write_runtime_config(cfg)
   if not file then
     return false, "file api missing"
   end
+  if sjson and sjson.encode then
+    local doc = read_runtime_config(cfg.CONFIG_PATH) or default_runtime_config(cfg)
+    if type(doc.websocket) ~= "table" then
+      doc.websocket = {}
+    end
+    doc.websocket.url = cfg.websocket.url or ""
+    doc.websocket.token = cfg.websocket.token or ""
+    doc.websocket.version = cfg.websocket.version or 1
+
+    local encoded_ok, encoded = pcall(sjson.encode, doc)
+    if encoded_ok and type(encoded) == "string" then
+      local text = encoded .. "\n"
+      if file.putcontents then
+        local ok, ret = pcall(function()
+          return file.putcontents(cfg.CONFIG_PATH, text)
+        end)
+        if ok and ret then
+          return true
+        end
+      end
+      local fd = file.open and file.open(cfg.CONFIG_PATH, "w+")
+      if not fd then
+        return false, "open config failed"
+      end
+      local ok = fd:write(text)
+      fd:close()
+      return ok and true or false, ok and nil or "write config failed"
+    end
+  end
+
   local text = "{\n" ..
     '  "ota": {\n' ..
     '    "url": "' .. json_escape(cfg.ota.url or "") .. '",\n' ..
@@ -114,9 +188,16 @@ local function write_runtime_config(cfg)
     '  "websocket": {\n' ..
     '    "url": "' .. json_escape(cfg.websocket.url or "") .. '",\n' ..
     '    "token": "' .. json_escape(cfg.websocket.token or "") .. '",\n' ..
-    '    "version": ' .. tostring(cfg.websocket.version or 3) .. "\n" ..
+    '    "version": ' .. tostring(cfg.websocket.version or 1) .. "\n" ..
     "  },\n" ..
-    '  "wake_word": "' .. json_escape(cfg.WAKE_WORD or "你好小智") .. '"\n' ..
+    '  "audio": {\n' ..
+    '    "sample_rate": ' .. tostring(cfg.AUDIO.rate or 16000) .. ',\n' ..
+    '    "channels": ' .. tostring(cfg.AUDIO.channels or 1) .. ',\n' ..
+    '    "frame_duration": ' .. tostring(cfg.AUDIO.frame_ms or 60) .. ',\n' ..
+    '    "bitrate": ' .. tostring(cfg.AUDIO.bitrate or 12000) .. "\n" ..
+    "  },\n" ..
+    '  "wake_word": "' .. json_escape(cfg.WAKE_WORD or "你好小智") .. '",\n' ..
+    '  "default_ui_style": "' .. json_escape(cfg.DEFAULT_UI_STYLE or "default") .. '"\n' ..
     "}\n"
   if file.putcontents then
     local ok, err = pcall(function()

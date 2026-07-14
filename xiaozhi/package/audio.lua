@@ -241,7 +241,7 @@ function M.new(cfg)
     wake_ready = false,
     wake_missing = false,
     voice_ready = false,
-    frame_pcm_bytes = 1920,
+    frame_pcm_bytes = math.floor(((cfg.AUDIO.rate or 16000) * (cfg.AUDIO.frame_ms or 60) / 1000)) * 2,
     wake_chunk_bytes = 1024,
     read_raw_bytes = 2048,
     pcm_bytes = 0,
@@ -277,7 +277,7 @@ function M.new(cfg)
   end
 
   local function raw_bytes_for_ms(ms, rate)
-    rate = tonumber(rate) or tonumber(cfg.AUDIO.rate) or 12000
+    rate = tonumber(rate) or tonumber(cfg.AUDIO.rate) or 16000
     return math.floor(rate * (tonumber(ms) or 0) / 1000) * 4
   end
 
@@ -375,6 +375,18 @@ function M.new(cfg)
     return self.mode == "bridge" or self.bridge_started
   end
 
+  function self:load_wake_module()
+    if self.wake then return true end
+    local wake_ok, wake_mod = pcall(require, cfg.WAKE_MODULE)
+    if wake_ok and type(wake_mod) == "table" then
+      self.wake = wake_mod
+      return true
+    end
+    print("[xiaozhi] wake require failed", wake_mod)
+    set_error("wake module load failed")
+    return false
+  end
+
   function self:load_modules()
     local ok, mod = pcall(require, cfg.XZ_MODULE)
     if not ok or type(mod) ~= "table" then
@@ -389,12 +401,7 @@ function M.new(cfg)
       return false
     end
 
-    local wake_ok, wake_mod = pcall(require, cfg.WAKE_MODULE)
-    if wake_ok and type(wake_mod) == "table" then
-      self.wake = wake_mod
-    else
-      print("[xiaozhi] wake require failed", wake_mod)
-    end
+    self:load_wake_module()
     return true
   end
 
@@ -439,7 +446,7 @@ function M.new(cfg)
       print("[xiaozhi] missing wake model", cfg.WAKE_INDEX, cfg.WAKE_DATA)
       return false
     end
-    if not self.wake and not self:load_modules() then
+    if not self.wake and not self:load_wake_module() then
       return false
     end
     if not self.wake or not self.wake.start then
@@ -478,7 +485,7 @@ function M.new(cfg)
       return
     end
     local ms = tonumber(cfg.AUDIO.capture_ms) or 1600
-    local pcm_limit = math.floor((cfg.AUDIO.rate or 12000) * ms / 1000) * 2
+    local pcm_limit = math.floor((cfg.AUDIO.rate or 16000) * ms / 1000) * 2
     if pcm_limit < 3200 then
       pcm_limit = 3200
     end
@@ -510,7 +517,7 @@ function M.new(cfg)
     local variants = { "b01", "b12", "b23" }
     local lines = {
       "reason=" .. tostring(reason or "done"),
-      "rate=" .. tostring(cfg.AUDIO.rate or 12000),
+      "rate=" .. tostring(cfg.AUDIO.rate or 16000),
       "channels=1",
       "mic_bits=" .. tostring(cfg.AUDIO.mic_bits or 32),
       "mic_pack=" .. tostring(cfg.AUDIO.mic_pack or "b23"),
@@ -520,7 +527,7 @@ function M.new(cfg)
     }
 
     write_file(dir .. "/mic_raw_32.i2s", raw)
-    write_file(dir .. "/mic_current.wav", wav_s16(pcm_current, cfg.AUDIO.rate or 12000, 1))
+    write_file(dir .. "/mic_current.wav", wav_s16(pcm_current, cfg.AUDIO.rate or 16000, 1))
 
     for _, pack in ipairs(variants) do
       local pcm = i2s32_to_s16(raw, pack, 0)
@@ -528,7 +535,7 @@ function M.new(cfg)
       lines[#lines + 1] = string.format(
         "%s samples=%d max=%.1f%% rms=%.1f%% dc=%d clipped=%d",
         pack, st.samples, st.max_pct, st.rms_pct, st.dc, st.clipped)
-      write_file(dir .. "/mic_" .. pack .. ".wav", wav_s16(pcm, cfg.AUDIO.rate or 12000, 1))
+      write_file(dir .. "/mic_" .. pack .. ".wav", wav_s16(pcm, cfg.AUDIO.rate or 16000, 1))
     end
 
     local current_stats = pcm_stats_s16(pcm_current)
@@ -920,7 +927,7 @@ function M.new(cfg)
       start_capture(mode)
       self.mode = "listen"
       local chunk_ms = tonumber(cfg.AUDIO.tx_chunk_ms) or 20
-      local samples = math.max(160, math.floor((cfg.AUDIO.rate or 12000) * chunk_ms / 1000))
+      local samples = math.max(160, math.floor((cfg.AUDIO.rate or 16000) * chunk_ms / 1000))
       self.read_raw_bytes = samples * 4
       flush_bridge_raw()
       return start_poll_timer("listen")
@@ -983,9 +990,9 @@ function M.new(cfg)
         print("[xiaozhi] capture_start fallback", tostring(err or ret))
       end
       local chunk_ms = tonumber(cfg.AUDIO.tx_chunk_ms) or 20
-      local samples = math.max(160, math.floor((cfg.AUDIO.rate or 12000) * chunk_ms / 1000))
+      local samples = math.max(160, math.floor((cfg.AUDIO.rate or 16000) * chunk_ms / 1000))
       self.read_raw_bytes = samples * 4
-      if not start_rx(samples, cfg.AUDIO.rate or 12000) then
+      if not start_rx(samples, cfg.AUDIO.rate or 16000) then
         return false
       end
     elseif mode == "speak" then

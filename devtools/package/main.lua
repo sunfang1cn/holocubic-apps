@@ -7,7 +7,7 @@ end
 DEVTOOLS = {}
 local APP = DEVTOOLS
 
-APP.VERSION = "2026-07-03-devtools-stream-v2"
+APP.VERSION = "2026-07-14-devtools-folder-transfer-v4"
 APP.ROOT_PATH = "/sd"
 APP.APPS_PATH = "/sd/apps"
 APP.RUN_APP_ID = "devrun"
@@ -1250,7 +1250,8 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
         <div class="toolbar">
           <button id="btnUp" type="button">上级</button>
           <button id="btnNewFolder" type="button" class="warn">新目录</button>
-          <button id="btnChooseUpload" type="button" class="primary">上传</button>
+          <button id="btnChooseUpload" type="button" class="primary">上传文件</button>
+          <button id="btnChooseFolder" type="button">上传文件夹</button>
         </div>
         <div class="row" style="margin-top:10px"><input id="dirPath" class="path-box" value="/sd"></div>
         <div class="row" style="margin-top:8px"><input id="searchInput" class="search-box" placeholder="搜索当前目录"></div>
@@ -1271,11 +1272,12 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
         </div>
         <div class="file-list" id="fileList"></div>
         <div class="dropzone" id="dropzone">
-          <strong>拖拽文件到这里上传</strong>
-          <div class="sub">上传到当前目录，覆盖同名文件</div>
+          <strong>拖拽文件或文件夹到这里上传</strong>
+          <div class="sub">递归保留目录结构，上传到当前目录并覆盖同名文件</div>
         </div>
         <div class="queue" id="uploadQueue"></div>
         <input id="fileInput" type="file" multiple class="hidden">
+        <input id="folderInput" type="file" webkitdirectory multiple class="hidden">
       </div>
     </aside>
 
@@ -1343,12 +1345,17 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
 const APP_BASE = "__APP_BASE__";
 const RUN_APP_ID = "__RUN_APP_ID__";
 const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
 let serverInfo = {root_path:"/sd", chunk_size:262144, max_file_size:67108864, preview_text_limit:262144, preview_media_limit:3145728};
 let currentDir = "/sd";
 let currentItems = [];
 let selectedItem = null;
 let previewObjectUrl = null;
 let loadedCode = "";
+const MAX_TREE_DEPTH = 32;
+const MAX_TREE_ENTRIES = 4096;
+const MAX_DIRECTORY_BATCHES = 256;
+const MAX_FOLDER_DOWNLOAD_BYTES = 128 * 1024 * 1024;
 
 function qs(id){return document.getElementById(id)}
 function apiUrl(path, params){
@@ -1387,6 +1394,16 @@ function parentPath(path){
 function joinPath(dir, name){
   return dir === serverInfo.root_path ? serverInfo.root_path + "/" + name : dir + "/" + name;
 }
+function normalizeRelativePath(path){
+  const raw = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  const parts = raw.split("/");
+  if(!raw || parts.length > MAX_TREE_DEPTH) throw new Error("目录层级超过 " + MAX_TREE_DEPTH + " 层");
+  for(const part of parts){
+    if(!part || part === "." || part === ".." || part.includes("\0")) throw new Error("不安全的相对路径: " + raw);
+  }
+  return parts.join("/");
+}
+function pathDepth(path){return String(path || "").split("/").filter(Boolean).length}
 function fileWebUrl(path){
   const root = serverInfo.root_path || "/sd";
   const text = String(path || "");
@@ -1420,7 +1437,7 @@ function setActionState(){
   const hasItem = !!selectedItem;
   const isDir = hasItem && selectedItem.is_dir;
   qs("btnPreview").disabled = !hasItem || isDir;
-  qs("btnDownload").disabled = !hasItem || isDir;
+  qs("btnDownload").disabled = !hasItem;
   qs("btnRename").disabled = !hasItem;
   qs("btnDelete").disabled = !hasItem;
   qs("btnCopyPath").disabled = !hasItem;
@@ -1525,9 +1542,13 @@ function renderList(items){
     openBtn.onclick = ev => {ev.stopPropagation(); item.is_dir ? loadDir(item.path).catch(err=>showStatus(err.message,true)) : (setSelected(item), previewSelected().catch(err=>showStatus(err.message,true)))};
     const downBtn = document.createElement("button");
     downBtn.className = "primary";
-    downBtn.textContent = item.is_dir ? "路径" : "下载";
-    downBtn.onclick = ev => {ev.stopPropagation(); item.is_dir ? copyText(item.path || "") : (setSelected(item), downloadSelected().catch(err=>showStatus(err.message,true)))};
-    actions.append(openBtn, downBtn);
+    downBtn.textContent = "下载";
+    downBtn.onclick = ev => {ev.stopPropagation(); setSelected(item); downloadSelected().catch(err=>showStatus(err.message,true))};
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "danger";
+    deleteBtn.textContent = "删除";
+    deleteBtn.onclick = ev => {ev.stopPropagation(); deletePath(item).catch(err=>showStatus(err.message,true))};
+    actions.append(openBtn, downBtn, deleteBtn);
     row.append(main, actions);
     box.appendChild(row);
   });
@@ -1581,9 +1602,148 @@ async function previewSelected(){
   }
   qs("previewBox").innerHTML = '<div class="preview-empty">该类型不提供网页内预览，请直接下载。</div>';
 }
+let crc32Table = null;
+function crc32(bytes){
+  if(!crc32Table){
+    crc32Table = new Uint32Array(256);
+    for(let n=0;n<256;n++){
+      let c = n;
+      for(let k=0;k<8;k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      crc32Table[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for(let i=0;i<bytes.length;i++) crc = crc32Table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function zipDateTime(now){
+  const year = Math.min(2107, Math.max(1980, now.getFullYear()));
+  return {
+    time:(now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2),
+    date:((year - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()
+  };
+}
+function makeZipEntry(path, bytes, isDir, localOffset, stamp){
+  let name = normalizeRelativePath(path);
+  if(isDir && !name.endsWith("/")) name += "/";
+  const nameBytes = textEncoder.encode(name);
+  if(nameBytes.length > 65535) throw new Error("ZIP 路径过长: " + name);
+  const data = isDir ? new Uint8Array(0) : bytes;
+  const checksum = isDir ? 0 : crc32(data);
+  const local = new Uint8Array(30);
+  const lv = new DataView(local.buffer);
+  lv.setUint32(0, 0x04034b50, true);
+  lv.setUint16(4, 20, true);
+  lv.setUint16(6, 0x0800, true);
+  lv.setUint16(8, 0, true);
+  lv.setUint16(10, stamp.time, true);
+  lv.setUint16(12, stamp.date, true);
+  lv.setUint32(14, checksum, true);
+  lv.setUint32(18, data.length, true);
+  lv.setUint32(22, data.length, true);
+  lv.setUint16(26, nameBytes.length, true);
+  const central = new Uint8Array(46);
+  const cv = new DataView(central.buffer);
+  cv.setUint32(0, 0x02014b50, true);
+  cv.setUint16(4, 20, true);
+  cv.setUint16(6, 20, true);
+  cv.setUint16(8, 0x0800, true);
+  cv.setUint16(10, 0, true);
+  cv.setUint16(12, stamp.time, true);
+  cv.setUint16(14, stamp.date, true);
+  cv.setUint32(16, checksum, true);
+  cv.setUint32(20, data.length, true);
+  cv.setUint32(24, data.length, true);
+  cv.setUint16(28, nameBytes.length, true);
+  cv.setUint32(38, isDir ? 0x10 : 0, true);
+  cv.setUint32(42, localOffset, true);
+  return {
+    localParts:[local, nameBytes, data],
+    localSize:local.length + nameBytes.length + data.length,
+    centralParts:[central, nameBytes],
+    centralSize:central.length + nameBytes.length
+  };
+}
+async function collectRemoteDirectory(rootItem){
+  const rootName = normalizeRelativePath(rootItem.name || "folder");
+  const entries = [];
+  const seen = new Set();
+  let totalBytes = 0;
+  async function walk(path, relativePath, depth){
+    if(depth > MAX_TREE_DEPTH) throw new Error("目录层级超过 " + MAX_TREE_DEPTH + " 层");
+    if(seen.has(path)) throw new Error("检测到重复目录路径: " + path);
+    seen.add(path);
+    if(entries.length >= MAX_TREE_ENTRIES) throw new Error("目录条目超过 " + MAX_TREE_ENTRIES + " 项");
+    entries.push({isDir:true, path, relativePath});
+    const data = await parseJson(await fetch(apiUrl("/api/list", {path})));
+    for(const item of Array.isArray(data.items) ? data.items : []){
+      const childPath = String(item.path || "");
+      if(!childPath.startsWith(path + "/")) throw new Error("目录返回了范围外路径");
+      const childRelative = normalizeRelativePath(relativePath + "/" + String(item.name || ""));
+      if(item.is_dir){
+        await walk(childPath, childRelative, depth + 1);
+      }else{
+        if(entries.length >= MAX_TREE_ENTRIES) throw new Error("目录条目超过 " + MAX_TREE_ENTRIES + " 项");
+        const size = Number(item.size || 0);
+        if(size > Number(serverInfo.max_file_size || 0)) throw new Error(item.name + " 超过单文件传输上限");
+        totalBytes += size;
+        if(totalBytes > MAX_FOLDER_DOWNLOAD_BYTES) throw new Error("文件夹超过 " + fmtBytes(MAX_FOLDER_DOWNLOAD_BYTES) + " 打包上限");
+        entries.push({isDir:false, path:childPath, relativePath:childRelative, size});
+      }
+    }
+  }
+  await walk(rootItem.path, rootName, 1);
+  return {entries, totalBytes};
+}
+async function downloadDirectory(item){
+  showStatus("正在扫描目录 " + item.name, false);
+  const tree = await collectRemoteDirectory(item);
+  const localParts = [];
+  const centralParts = [];
+  const stamp = zipDateTime(new Date());
+  let localOffset = 0;
+  let centralSize = 0;
+  let fileIndex = 0;
+  const fileCount = tree.entries.filter(entry=>!entry.isDir).length;
+  for(const entry of tree.entries){
+    let bytes = new Uint8Array(0);
+    if(!entry.isDir){
+      fileIndex += 1;
+      bytes = await fetchFileBytes(entry.path, entry.size, (done,total)=>showStatus("打包 " + fileIndex + "/" + fileCount + " · " + entry.relativePath + " · " + fmtBytes(done) + " / " + fmtBytes(total || entry.size), false));
+    }
+    if(localOffset + bytes.length > 0xffffffff) throw new Error("ZIP 超过 4 GB 格式上限");
+    const built = makeZipEntry(entry.relativePath, bytes, entry.isDir, localOffset, stamp);
+    localParts.push(...built.localParts);
+    centralParts.push(...built.centralParts);
+    localOffset += built.localSize;
+    centralSize += built.centralSize;
+  }
+  if(tree.entries.length > 65535 || localOffset + centralSize > 0xffffffff) throw new Error("ZIP 条目或大小超过格式上限");
+  const end = new Uint8Array(22);
+  const ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, tree.entries.length, true);
+  ev.setUint16(10, tree.entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, localOffset, true);
+  const blob = new Blob([...localParts, ...centralParts, end], {type:"application/zip"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = (item.name || "folder") + ".zip";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  showStatus("已生成 " + a.download + " · " + tree.entries.length + " 项 · " + fmtBytes(tree.totalBytes), false);
+}
 async function downloadSelected(){
-  if(!selectedItem) throw new Error("请先选择文件");
-  if(selectedItem.is_dir) throw new Error("目录不能直接下载");
+  if(!selectedItem) throw new Error("请先选择项目");
+  if(selectedItem.is_dir){
+    await downloadDirectory(selectedItem);
+    return;
+  }
   if(Number(selectedItem.size || 0) > Number(serverInfo.max_file_size || 0)) throw new Error("文件超过 " + fmtBytes(serverInfo.max_file_size) + " 传输上限");
   const a = document.createElement("a");
   a.href = fileWebUrl(selectedItem.path);
@@ -1626,30 +1786,146 @@ function addQueueItem(name){
   qs("uploadQueue").prepend(wrap);
   return {bar:wrap.querySelector(".progress>div"), status:wrap.querySelector("[data-status]")};
 }
-async function uploadOneFile(file){
-  if(file.size > serverInfo.max_file_size) throw new Error(file.name + " 超过单文件大小限制");
-  const item = addQueueItem(file.name);
+function inputUploadBatch(files){
+  return {
+    files:Array.from(files || []).map(file=>({file, relativePath:normalizeRelativePath(file.webkitRelativePath || file.name)})),
+    dirs:[]
+  };
+}
+function prepareUploadBatch(batch){
+  const files = Array.isArray(batch && batch.files) ? batch.files : [];
+  const sourceDirs = Array.isArray(batch && batch.dirs) ? batch.dirs : [];
+  const dirs = new Set();
+  const filePaths = new Set();
+  let totalBytes = 0;
+  for(const rawDir of sourceDirs) dirs.add(normalizeRelativePath(rawDir));
+  const normalizedFiles = files.map(task=>{
+    const file = task.file;
+    if(!file) throw new Error("上传条目缺少文件数据");
+    const relativePath = normalizeRelativePath(task.relativePath || file.webkitRelativePath || file.name);
+    if(filePaths.has(relativePath)) throw new Error("上传列表包含重复路径: " + relativePath);
+    if(Number(file.size || 0) > Number(serverInfo.max_file_size || 0)) throw new Error(relativePath + " 超过单文件大小限制");
+    filePaths.add(relativePath);
+    totalBytes += Number(file.size || 0);
+    const parts = relativePath.split("/");
+    parts.pop();
+    let parent = "";
+    for(const part of parts){
+      parent = parent ? parent + "/" + part : part;
+      dirs.add(parent);
+    }
+    return {file, relativePath};
+  });
+  for(const path of filePaths){
+    if(dirs.has(path)) throw new Error("同一路径同时是文件和目录: " + path);
+  }
+  const normalizedDirs = Array.from(dirs).sort((a,b)=>pathDepth(a)-pathDepth(b) || a.localeCompare(b));
+  if(normalizedFiles.length + normalizedDirs.length > MAX_TREE_ENTRIES) throw new Error("上传条目超过 " + MAX_TREE_ENTRIES + " 项");
+  return {files:normalizedFiles, dirs:normalizedDirs, totalBytes};
+}
+async function ensureRemoteDirectory(baseDir, relativePath){
+  const path = joinPath(baseDir, relativePath);
+  const res = await fetch(apiUrl("/api/mkdir", {path}), {method:"POST"});
+  if(res.status === 409){
+    const stat = await parseJson(await fetch(apiUrl("/api/stat", {path})));
+    if(!stat.is_dir) throw new Error("目标路径不是目录: " + path);
+    return;
+  }
+  await parseJson(res);
+}
+async function uploadOneFile(task, baseDir){
+  const file = task.file;
+  const relativePath = task.relativePath;
+  const queue = addQueueItem(relativePath);
   let offset = 0;
-  while(offset < file.size || (file.size === 0 && offset === 0)){
-    const end = Math.min(offset + serverInfo.chunk_size, file.size);
-    const res = await fetch(apiUrl("/api/upload", {path:joinPath(currentDir, file.name), offset, total:file.size}), {method:"PUT", body:file.slice(offset, end)});
-    const data = await parseJson(res);
-    offset = Number(data.next_offset || end);
-    const pct = file.size > 0 ? Math.min(100, Math.round(offset * 100 / file.size)) : 100;
-    item.bar.style.width = pct + "%";
-    item.status.textContent = pct + "%";
-    if(file.size === 0) break;
+  try{
+    while(offset < file.size || (file.size === 0 && offset === 0)){
+      const end = Math.min(offset + serverInfo.chunk_size, file.size);
+      const res = await fetch(apiUrl("/api/upload", {path:joinPath(baseDir, relativePath), offset, total:file.size}), {method:"PUT", body:file.slice(offset, end)});
+      const data = await parseJson(res);
+      offset = Number(data.next_offset || end);
+      const pct = file.size > 0 ? Math.min(100, Math.round(offset * 100 / file.size)) : 100;
+      queue.bar.style.width = pct + "%";
+      queue.status.textContent = pct + "%";
+      if(file.size === 0) break;
+    }
+  }catch(err){
+    queue.status.textContent = "失败";
+    throw err;
   }
 }
-async function uploadFiles(files){
-  const arr = Array.from(files || []);
-  if(!arr.length) return;
-  for(const f of arr){
-    try{showStatus("上传 " + f.name, false); await uploadOneFile(f)}
-    catch(err){showStatus(err.message, true)}
+async function uploadBatch(batch){
+  const prepared = prepareUploadBatch(batch);
+  if(!prepared.files.length && !prepared.dirs.length) return;
+  const targetDir = currentDir;
+  showStatus("准备上传 " + prepared.files.length + " 个文件、" + prepared.dirs.length + " 个目录 · " + fmtBytes(prepared.totalBytes), false);
+  for(const dir of prepared.dirs){
+    showStatus("创建目录 " + dir, false);
+    await ensureRemoteDirectory(targetDir, dir);
   }
-  await loadDir(currentDir);
-  showStatus("上传任务结束", false);
+  let failed = 0;
+  for(const task of prepared.files){
+    try{
+      showStatus("上传 " + task.relativePath, false);
+      await uploadOneFile(task, targetDir);
+    }catch(err){
+      failed += 1;
+      showStatus(err.message, true);
+    }
+  }
+  if(currentDir === targetDir) await loadDir(targetDir);
+  showStatus(failed ? ("上传结束，失败 " + failed + " 个文件") : ("上传完成：" + prepared.files.length + " 个文件、" + prepared.dirs.length + " 个目录"), failed > 0);
+}
+async function uploadFiles(files){return uploadBatch(inputUploadBatch(files))}
+function readEntryFile(entry){
+  return new Promise((resolve,reject)=>entry.file(resolve,reject));
+}
+function readEntryBatch(reader){
+  return new Promise((resolve,reject)=>reader.readEntries(resolve,reject));
+}
+async function collectDroppedBatch(dataTransfer){
+  const items = Array.from(dataTransfer && dataTransfer.items || []).filter(item=>item.kind === "file");
+  if(!items.length) return inputUploadBatch(dataTransfer && dataTransfer.files);
+  const roots = [];
+  const fallbackFiles = [];
+  for(const item of items){
+    const getter = item.getAsEntry || item.webkitGetAsEntry;
+    const entry = getter ? getter.call(item) : null;
+    if(entry) roots.push(entry);
+    else{
+      const file = item.getAsFile && item.getAsFile();
+      if(file) fallbackFiles.push({file, relativePath:normalizeRelativePath(file.name)});
+    }
+  }
+  if(!roots.length) return {files:fallbackFiles, dirs:[]};
+  const result = {files:fallbackFiles, dirs:[]};
+  const visited = new Set();
+  let entryCount = fallbackFiles.length;
+  async function walk(entry, parentRelative, depth){
+    if(depth > MAX_TREE_DEPTH) throw new Error("目录层级超过 " + MAX_TREE_DEPTH + " 层");
+    const relativePath = normalizeRelativePath(parentRelative ? parentRelative + "/" + entry.name : entry.name);
+    const key = (entry.isDirectory ? "d:" : "f:") + relativePath;
+    if(visited.has(key)) return;
+    visited.add(key);
+    entryCount += 1;
+    if(entryCount > MAX_TREE_ENTRIES) throw new Error("拖拽条目超过 " + MAX_TREE_ENTRIES + " 项");
+    if(entry.isFile){
+      result.files.push({file:await readEntryFile(entry), relativePath});
+      return;
+    }
+    if(!entry.isDirectory) return;
+    result.dirs.push(relativePath);
+    const reader = entry.createReader();
+    let ended = false;
+    for(let batchIndex=0;batchIndex<MAX_DIRECTORY_BATCHES;batchIndex++){
+      const batch = await readEntryBatch(reader);
+      if(!batch.length){ended = true; break}
+      for(const child of batch) await walk(child, relativePath, depth + 1);
+    }
+    if(!ended) throw new Error("目录批次数超过 " + MAX_DIRECTORY_BATCHES + " 次");
+  }
+  for(const root of roots) await walk(root, "", 1);
+  return result;
 }
 function copyText(text){
   if(!text) return;
@@ -1724,6 +2000,8 @@ qs("btnUp").onclick = () => loadDir(parentPath(currentDir)).catch(err=>showStatu
 qs("btnNewFolder").onclick = () => createFolder().catch(err=>showStatus(err.message,true));
 qs("btnChooseUpload").onclick = () => qs("fileInput").click();
 qs("fileInput").onchange = () => {uploadFiles(qs("fileInput").files).catch(err=>showStatus(err.message,true)); qs("fileInput").value = ""};
+qs("btnChooseFolder").onclick = () => qs("folderInput").click();
+qs("folderInput").onchange = () => {uploadFiles(qs("folderInput").files).catch(err=>showStatus(err.message,true)); qs("folderInput").value = ""};
 qs("searchInput").oninput = () => renderList(currentItems);
 qs("sortSelect").onchange = () => renderList(currentItems);
 qs("dirPath").onkeydown = ev => {if(ev.key === "Enter") loadDir(qs("dirPath").value.trim() || serverInfo.root_path).catch(err=>showStatus(err.message,true))};
@@ -1752,7 +2030,7 @@ qs("codeInput").addEventListener("keydown", ev => {
 const dropzone = qs("dropzone");
 ["dragenter","dragover"].forEach(name => dropzone.addEventListener(name, ev => {ev.preventDefault(); dropzone.classList.add("drag")}));
 ["dragleave","drop"].forEach(name => dropzone.addEventListener(name, ev => {ev.preventDefault(); dropzone.classList.remove("drag")}));
-dropzone.addEventListener("drop", ev => uploadFiles(ev.dataTransfer && ev.dataTransfer.files).catch(err=>showStatus(err.message,true)));
+dropzone.addEventListener("drop", ev => collectDroppedBatch(ev.dataTransfer).then(uploadBatch).catch(err=>showStatus(err.message,true)));
 (async function boot(){
   try{
     setActionState();

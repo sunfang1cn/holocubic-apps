@@ -8,18 +8,20 @@ M.APP_DIR = "/sd/apps/xiaozhi"
 M.XZ_MODULE = M.APP_DIR .. "/xiaozhi.so"
 M.WAKE_MODULE = M.APP_DIR .. "/wake.so"
 M.CONFIG_PATH = M.APP_DIR .. "/config.json"
+M.MCP_DIR = M.APP_DIR .. "/mcp"
 M.WAKE_MODEL_DIR = M.APP_DIR .. "/wake/wn9s_nihaoxiaozhi"
 M.WAKE_INDEX = M.WAKE_MODEL_DIR .. "/wn9_index"
 M.WAKE_DATA = M.WAKE_MODEL_DIR .. "/wn9_data"
 M.WAKE_WORD = "你好小智"
 M.TIMEZONE = "CST-8"
+M.DEFAULT_UI_STYLE = "default"
 M.ASSET_DIR = M.APP_DIR .. "/assets"
 M.EMOJI_GIF_DIR = M.ASSET_DIR .. "/emojis/gif"
 M.EMOJI_PNG_DIR = M.ASSET_DIR .. "/emojis/png"
 M.TEXT_FONT_PATH = M.ASSET_DIR .. "/fonts/noto_sans_sc_medium_16_2bpp_common4000.bin"
 
 M.AUDIO = {
-  rate = 12000,
+  rate = 16000,
   wake_rate = 16000,
   channels = 1,
   frame_ms = 60,
@@ -125,8 +127,9 @@ local function pick_block(raw, name)
 end
 
 local function decode_json(raw)
-  if sjson and sjson.decode then
-    local ok, obj = pcall(sjson.decode, raw)
+  local codec = rawget(_G, "json") or rawget(_G, "sjson")
+  if codec and codec.decode then
+    local ok, obj = pcall(codec.decode, raw)
     if ok and type(obj) == "table" then
       return obj
     end
@@ -146,6 +149,28 @@ local function apply_websocket(ws)
   end
   if tonumber(ws.version) then
     M.websocket.version = math.floor(tonumber(ws.version))
+  end
+end
+
+local function apply_audio(audio)
+  if type(audio) ~= "table" then
+    return
+  end
+  local rate = tonumber(audio.sample_rate or audio.rate)
+  local channels = tonumber(audio.channels)
+  local frame_ms = tonumber(audio.frame_duration or audio.frame_ms)
+  local bitrate = tonumber(audio.bitrate)
+  if rate and rate > 0 then
+    M.AUDIO.rate = math.floor(rate)
+  end
+  if channels and channels > 0 then
+    M.AUDIO.channels = math.floor(channels)
+  end
+  if frame_ms and frame_ms > 0 then
+    M.AUDIO.frame_ms = math.floor(frame_ms)
+  end
+  if bitrate and bitrate > 0 then
+    M.AUDIO.bitrate = math.floor(bitrate)
   end
 end
 
@@ -173,6 +198,16 @@ local function apply_ota(ota)
   end
 end
 
+local function apply_default_ui_style(value)
+  if type(value) == "string" then
+    value = value:match("^%s*(.-)%s*$"):lower()
+  end
+  if value == "default" or value == "wechat" then
+    M.DEFAULT_UI_STYLE = value
+    M.default_ui_style = value
+  end
+end
+
 function M.load()
   local raw = read_text(M.CONFIG_PATH)
   if not raw then
@@ -183,6 +218,9 @@ function M.load()
   if obj then
     apply_websocket(obj.websocket)
     apply_ota(obj.ota)
+    apply_audio(obj.audio or obj.audio_params)
+    apply_default_ui_style(obj.default_ui_style)
+    print("[xiaozhi] default ui style", tostring(M.DEFAULT_UI_STYLE))
     if type(obj.wake_word) == "string" and obj.wake_word ~= "" then
       M.WAKE_WORD = obj.wake_word
     end
@@ -194,11 +232,13 @@ function M.load()
 
   local ws_block = pick_block(raw, "websocket") or raw
   local ota_block = pick_block(raw, "ota") or ""
+  local audio_block = pick_block(raw, "audio") or pick_block(raw, "audio_params") or ""
   local url = pick_string(ws_block, "url")
   local token = pick_string(ws_block, "token")
   local version = pick_number(ws_block, "version")
   local wake_word = pick_string(raw, "wake_word")
   local timezone = pick_string(raw, "timezone")
+  local default_ui_style = pick_string(raw, "default_ui_style")
 
   if url and url:match("^wss?://") then
     M.websocket.url = url
@@ -215,6 +255,8 @@ function M.load()
   if timezone and timezone ~= "" then
     M.TIMEZONE = timezone
   end
+  apply_default_ui_style(default_ui_style)
+  print("[xiaozhi] default ui style", tostring(M.DEFAULT_UI_STYLE))
   if ota_block ~= "" then
     local ota_url = pick_string(ota_block, "url")
     local enabled = pick_bool(ota_block, "enabled")
@@ -229,6 +271,14 @@ function M.load()
       interval_ms = interval_ms,
       max_polls = max_polls,
       timeout_ms = timeout_ms,
+    })
+  end
+  if audio_block ~= "" then
+    apply_audio({
+      sample_rate = pick_number(audio_block, "sample_rate") or pick_number(audio_block, "rate"),
+      channels = pick_number(audio_block, "channels"),
+      frame_duration = pick_number(audio_block, "frame_duration") or pick_number(audio_block, "frame_ms"),
+      bitrate = pick_number(audio_block, "bitrate"),
     })
   end
 

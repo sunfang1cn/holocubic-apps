@@ -55,7 +55,7 @@ if ([string]::IsNullOrEmpty($commonNonAsciiSymbols)) {
 }
 
 $usedText = @'
-设置设备信息蓝牙亮度关闭客户端热点不可用已连接配对中已开启未启用等待设备降低提高切换开启读取失败设置失败启动失败关闭失败已关闭重新扫描操作失败左右切换页面上下选择调整返回处理器运存卡系统版本地址未分配强制退出上级按键映射
+设置设备信息蓝牙手柄亮度关闭客户端热点不可用不支持已连接连接中配对中扫描中已开启已禁用未启用等待设备服务未运行启动中驱动停止正在查找发现按键位图降低提高切换开启读取失败设置失败启动失败关闭失败已关闭重新扫描重扫操作失败左右切换页面上下选择调整返回处理器运存卡系统版本地址未分配强制退出上级按键映射
 '@
 $usedSymbols = -join ($usedText.ToCharArray() | Where-Object { [int]$_ -gt 127 } | Select-Object -Unique)
 if ([string]::IsNullOrEmpty($usedSymbols)) {

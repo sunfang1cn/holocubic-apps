@@ -10,7 +10,7 @@ elseif prev and prev.shutdown then
 end
 
 SETTINGS_APP = {
-  VERSION = "2026-07-01-settings-ui-v2",
+  VERSION = "2026-07-13-settings-hidpad-v3",
   APP_DIR = "/sd/apps/settings",
   SCREEN_W = 320,
   SCREEN_H = 240,
@@ -30,6 +30,12 @@ SETTINGS_APP = {
     input_mode = "none",
     repeat_state = {},
     key_debounce = {},
+    hidpad_status = nil,
+    hidpad_status_ms = 0,
+    hidpad_request_ms = 0,
+    hidpad_installed = nil,
+    hidpad_catalog_ms = 0,
+    hidpad_pending_command = nil,
   },
   input = {
     up_code = nil,
@@ -61,9 +67,9 @@ SETTINGS_APP = {
       hint = "",
     },
     {
-      id = "gamepad",
+      id = "hidpad",
       kind = "toggle",
-      title = "蓝牙",
+      title = "蓝牙手柄",
       value = false,
       available = true,
       accent = 0x4DBD8B,
@@ -72,6 +78,9 @@ SETTINGS_APP = {
       name = "",
       address = "",
       profile = "",
+      phase = "unsupported",
+      buttons = 0,
+      raw_buttons = 0,
     },
     {
       id = "brightness",
@@ -89,6 +98,13 @@ SETTINGS_APP = {
 }
 
 local APP = SETTINGS_APP
+local HIDPAD_SERVICE_ID = "hidpad"
+local HIDPAD_ENDPOINT = "ble-controller"
+local SETTINGS_HIDPAD_ENDPOINT = "settings-hidpad"
+local HIDPAD_MANIFEST_PATH = "/sd/apps/hidpad/app.info"
+local HIDPAD_CATALOG_CACHE_MS = 5000
+local HIDPAD_STATUS_INTERVAL_MS = 1000
+local HIDPAD_STATUS_TTL_MS = 3500
 
 local MAIN_PART = rawget(_G, "LV_PART_MAIN") or 0
 local DEFAULT_STATE = rawget(_G, "LV_STATE_DEFAULT") or 0
@@ -211,6 +227,56 @@ local function clamp(value, min_value, max_value)
     return max_value
   end
   return math.floor(num + 0.5)
+end
+
+local function clock_ms()
+  if sys and sys.millis then
+    local ok, value = pcall(function()
+      return sys.millis()
+    end)
+    if ok and type(value) == "number" then
+      return value
+    end
+  end
+  if type(millis) == "function" then
+    local ok, value = pcall(millis)
+    if ok and type(value) == "number" then
+      return value
+    end
+  end
+  if os and type(os.clock) == "function" then
+    return math.floor(os.clock() * 1000)
+  end
+  return 0
+end
+
+local function json_encode(value)
+  if not json or not json.encode then
+    return nil, "json.encode 不可用"
+  end
+  local ok, raw = pcall(function()
+    return json.encode(value)
+  end)
+  if not ok then
+    return nil, tostring(raw)
+  end
+  return raw
+end
+
+local function json_decode(raw)
+  if not json or not json.decode then
+    return nil, "json.decode 不可用"
+  end
+  local ok, value, err = pcall(function()
+    return json.decode(raw)
+  end)
+  if not ok then
+    return nil, tostring(value)
+  end
+  if type(value) ~= "table" then
+    return nil, tostring(err or "状态格式错误")
+  end
+  return value
 end
 
 local function disable_scroll(obj)
@@ -371,15 +437,19 @@ local function wifi_value_text(mode)
 end
 
 local function toggle_state_text(item)
-  if not item or not item.available then
+  if not item then
     return "不可用"
   end
-  if item.id == "gamepad" then
+  if item.id == "hidpad" then
+    if item.phase == "unsupported" then return "不支持" end
+    if not item.available then return "不可用" end
+    if not item.value or item.phase == "disabled" then return "已禁用" end
     if item.state_connected then return "已连接" end
-    if item.state_connecting then return "配对中" end
-    if item.value then return "已开启" end
-    return "关闭"
+    if item.state_connecting or item.phase == "connecting" then return "连接中" end
+    if item.phase == "scanning" or item.phase == "select_device" then return "扫描中" end
+    return "已开启"
   end
+  if not item.available then return "不可用" end
   return item.value and "开启" or "关闭"
 end
 
@@ -391,10 +461,152 @@ local function item_summary(item)
     return "Wi-Fi " .. text_or(item.value_label, "")
   elseif item.id == "brightness" then
     return "亮度 " .. brightness_text(item.value)
-  elseif item.id == "gamepad" then
-    return "蓝牙 " .. toggle_state_text(item)
+  elseif item.id == "hidpad" then
+    return "蓝牙手柄 " .. toggle_state_text(item)
   end
   return item.title
+end
+
+local function hidpad_installed(force)
+  local stamp = clock_ms()
+  local cached_at = tonumber(APP.state.hidpad_catalog_ms) or 0
+  if not force
+    and APP.state.hidpad_installed ~= nil
+    and stamp >= cached_at
+    and (stamp - cached_at) < HIDPAD_CATALOG_CACHE_MS
+  then
+    return APP.state.hidpad_installed
+  end
+
+  local installed = false
+  if app and app.services then
+    local ok, services = pcall(function()
+      return app.services()
+    end)
+    if ok and type(services) == "table" then
+      for _, record in ipairs(services) do
+        if type(record) == "table" and record.id == HIDPAD_SERVICE_ID then
+          installed = true
+          break
+        end
+      end
+    end
+  end
+  if not installed and file and file.stat then
+    local ok, stat = pcall(function()
+      return file.stat(HIDPAD_MANIFEST_PATH)
+    end)
+    installed = ok and type(stat) == "table"
+  end
+
+  APP.state.hidpad_installed = installed
+  APP.state.hidpad_catalog_ms = stamp
+  if not installed then
+    APP.state.hidpad_status = nil
+    APP.state.hidpad_status_ms = 0
+  end
+  return installed
+end
+
+local function hidpad_service_running()
+  if not app or not app.services then
+    return false
+  end
+  local ok, services = pcall(function()
+    return app.services()
+  end)
+  if not ok or type(services) ~= "table" then
+    return false
+  end
+  for _, record in ipairs(services) do
+    if type(record) == "table" and record.id == HIDPAD_SERVICE_ID then
+      return true
+    end
+  end
+  return false
+end
+
+local function send_hidpad_command(topic)
+  if not hidpad_installed(false) then
+    return nil, "不支持"
+  end
+  if not ipc or not ipc.send then
+    return nil, "手柄通信不可用"
+  end
+  local payload, encode_err = json_encode({ reply = SETTINGS_HIDPAD_ENDPOINT })
+  if not payload then
+    return nil, encode_err
+  end
+  local ok_call, sent, send_err = pcall(function()
+    return ipc.send(HIDPAD_ENDPOINT, topic, payload)
+  end)
+  if not ok_call then
+    return nil, tostring(sent)
+  end
+  if not sent then
+    return nil, tostring(send_err or "手柄服务未运行")
+  end
+  return true
+end
+
+local function request_hidpad_status(force)
+  if not hidpad_installed(false) then
+    return false
+  end
+  local stamp = clock_ms()
+  local requested_at = tonumber(APP.state.hidpad_request_ms) or 0
+  if not force
+    and stamp >= requested_at
+    and (stamp - requested_at) < HIDPAD_STATUS_INTERVAL_MS
+  then
+    return true
+  end
+  APP.state.hidpad_request_ms = stamp
+  local ok = send_hidpad_command("status")
+  return ok == true
+end
+
+local function bind_hidpad_status()
+  if not ipc or not ipc.listen then
+    return false
+  end
+  local ok_call, listened, listen_err = pcall(function()
+    return ipc.listen(SETTINGS_HIDPAD_ENDPOINT, function(topic, payload)
+      if topic ~= "status" or type(payload) ~= "string" then
+        return
+      end
+      local status, decode_err = json_decode(payload)
+      if not status then
+        print("[settings] hidpad.status", tostring(decode_err))
+        return
+      end
+      APP.state.hidpad_status = status
+      APP.state.hidpad_status_ms = clock_ms()
+    end)
+  end)
+  if not ok_call or not listened then
+    print("[settings] hidpad.listen", tostring(listen_err or listened))
+    return false
+  end
+  return true
+end
+
+local function hidpad_identity(name, address)
+  local device_name = clip_utf8_chars(text_or(name, ""), 9)
+  local device_address = text_or(address, "")
+  if #device_address > 8 then
+    device_address = device_address:sub(-8)
+  end
+  if device_name ~= "" and device_address ~= "" then
+    return device_name .. " · " .. device_address
+  end
+  return device_name ~= "" and device_name or device_address
+end
+
+local function button_bitmap(value)
+  local mask = tonumber(value) or 0
+  if mask < 0 then mask = 0 end
+  return string.format("0x%04X", mask & 0xFFFF)
 end
 
 local function refresh_wifi_item()
@@ -443,49 +655,117 @@ local function refresh_wifi_item()
   end
 end
 
-local function refresh_gamepad_item()
+local function refresh_hidpad_item()
   local item = APP.items[2]
   item.available = false
   item.value = false
   item.state_connected = false
   item.state_connecting = false
-  item.detail = "不可用"
+  item.phase = "unsupported"
+  item.detail = "不支持"
   item.name = ""
   item.address = ""
   item.profile = ""
+  item.buttons = 0
+  item.raw_buttons = 0
+  item.pressed = 0
+  item.released = 0
+  item.scan_count = 0
+  item.last_error = ""
   item.hint = ""
 
-  if not gamepad or not gamepad.state then
+  if not hidpad_installed(false) then
     return
   end
 
-  local state, err = safe_call("gamepad.state", function()
-    return gamepad.state()
-  end)
-  if type(state) ~= "table" then
-    item.detail = clip_text(err or "读取失败", 18)
-    return
+  local running = hidpad_service_running()
+  if running and APP.state.hidpad_pending_command then
+    local pending = APP.state.hidpad_pending_command
+    local sent = send_hidpad_command(pending)
+    if sent then
+      APP.state.hidpad_pending_command = nil
+    end
+  end
+  if running then
+    request_hidpad_status(false)
   end
 
   item.available = true
-  item.value = state.started and true or false
-  item.state_connected = state.connected and true or false
-  item.state_connecting = state.connecting and true or false
-  item.name = text_or(state.name, "")
-  item.address = text_or(state.address, text_or(state.last_address, ""))
-  item.profile = text_or(state.profile, "")
-  if item.state_connected then
-    item.detail = text_or(item.name, text_or(item.address, "已连接"))
-    item.hint = "← 关闭  重连 →"
-  elseif item.state_connecting then
-    item.detail = text_or(item.name, text_or(item.address, "配对中"))
-    item.hint = "← 关闭  重连 →"
-  elseif item.value then
-    item.detail = text_or(item.name, text_or(item.address, "等待设备"))
-    item.hint = "← 关闭  重连 →"
-  else
-    item.detail = text_or(item.name, text_or(item.address, "未启用"))
+  item.phase = running and "starting" or "stopped"
+  item.value = running
+
+  local stamp = clock_ms()
+  local status_at = tonumber(APP.state.hidpad_status_ms) or 0
+  local status = APP.state.hidpad_status
+  local status_fresh = type(status) == "table"
+    and stamp >= status_at
+    and (stamp - status_at) <= HIDPAD_STATUS_TTL_MS
+  if status_fresh then
+    item.value = status.enabled ~= false
+    item.phase = text_or(status.phase, item.value and "idle" or "disabled")
+    item.state_connected = status.connected == true
+    item.state_connecting = status.connecting == true
+    item.name = text_or(status.name, "")
+    item.address = text_or(status.address, "")
+    item.profile = text_or(status.profile, "")
+    item.buttons = tonumber(status.buttons) or 0
+    item.raw_buttons = tonumber(status.raw_buttons) or 0
+    item.scan_count = tonumber(status.scan_count) or 0
+    item.last_error = text_or(status.error, "")
+  end
+
+  if controller and controller.state then
+    local ok, state = pcall(function()
+      return controller.state("ble-main")
+    end)
+    if ok and type(state) == "table" then
+      item.state_connected = item.state_connected or state.connected == true
+      item.buttons = tonumber(state.buttons) or item.buttons
+      item.pressed = tonumber(state.pressed) or 0
+      item.released = tonumber(state.released) or 0
+      if item.name == "" then item.name = text_or(state.name, "") end
+      if item.address == "" then item.address = text_or(state.device_id, "") end
+    end
+  end
+
+  local identity = hidpad_identity(item.name, item.address)
+  if item.last_error:find("版本不支持", 1, true) then
+    item.available = false
+    item.value = false
+    item.phase = "unsupported"
+    item.detail = "不支持"
+    item.hint = ""
+    return
+  elseif status_fresh and (status.command_ok == false or item.phase == "error") and item.last_error ~= "" then
+    item.detail = clip_utf8_chars(item.last_error, 14)
+    item.hint = "← 关闭  重扫 →"
+    return
+  end
+  if not running and not status_fresh then
+    item.value = false
+    item.detail = "服务未运行"
+    item.hint = "→ 启动服务"
+    return
+  elseif not item.value or item.phase == "disabled" then
+    item.value = false
+    item.phase = "disabled"
+    item.detail = "BLE 驱动已停止"
     item.hint = "← 关闭  开启 →"
+    return
+  end
+
+  if item.state_connected then
+    item.detail = identity ~= "" and identity or "已连接"
+    item.hint = item.buttons ~= 0 and ("按键 " .. button_bitmap(item.buttons)) or "← 关闭  重扫 →"
+  elseif item.state_connecting then
+    item.detail = identity ~= "" and identity or "正在连接手柄"
+    item.hint = "← 关闭  重扫 →"
+  elseif item.phase == "scanning" or item.phase == "select_device" then
+    item.detail = item.scan_count > 0 and ("发现 " .. tostring(item.scan_count) .. " 个设备") or "正在查找手柄"
+    item.hint = "← 关闭  重扫 →"
+  else
+    item.detail = identity ~= "" and identity or "等待设备"
+    item.hint = "← 关闭  重扫 →"
   end
 end
 
@@ -548,7 +828,7 @@ end
 
 local function refresh_runtime_state()
   refresh_wifi_item()
-  refresh_gamepad_item()
+  refresh_hidpad_item()
   refresh_brightness_item()
   refresh_ip_state()
 end
@@ -637,59 +917,42 @@ local function cycle_wifi_mode()
   return true, "Wi-Fi " .. wifi_value_text(target)
 end
 
-local function set_gamepad_enabled(enable)
-  if not gamepad or not gamepad.start or not gamepad.stop then
-    return nil, "蓝牙不可用"
+local function set_hidpad_enabled(enable)
+  if not hidpad_installed(false) then
+    return nil, "蓝牙手柄不支持"
   end
 
-  if enable then
-    if gamepad.off then
-      pcall(function()
-        gamepad.off()
+  local command = enable and "enable" or "disable"
+  if not hidpad_service_running() then
+    APP.state.hidpad_pending_command = command
+    if enable and app and app.start_service then
+      local ok_call, started, start_err = pcall(function()
+        return app.start_service(HIDPAD_SERVICE_ID)
       end)
+      if not ok_call or not started then
+        return nil, tostring(start_err or started or "手柄服务启动失败")
+      end
+      return true, "手柄服务启动中"
     end
-    local ok_call, ok_start, err = pcall(function()
-      return gamepad.start({
-        clear_bonds = false,
-        debug = false,
-      })
-    end)
-    if not ok_call or not ok_start then
-      return nil, tostring(err or ok_start or "蓝牙启动失败")
-    end
-    return true, "蓝牙已开启"
+    return true, "等待手柄服务"
   end
 
-  if gamepad.off then
-    pcall(function()
-      gamepad.off()
-    end)
+  local sent, send_err = send_hidpad_command(command)
+  if not sent then
+    return nil, send_err
   end
-  local ok_call, err = pcall(function()
-    return gamepad.stop()
-  end)
-  if not ok_call then
-    return nil, tostring(err or "蓝牙关闭失败")
-  end
-  return true, "蓝牙已关闭"
+  return true, enable and "蓝牙手柄正在开启" or "蓝牙手柄正在关闭"
 end
 
-local function reconnect_gamepad()
-  if not gamepad then
-    return nil, "蓝牙不可用"
+local function rescan_hidpad()
+  if not hidpad_installed(false) then
+    return nil, "蓝牙手柄不支持"
   end
-  if gamepad.rescan then
-    local ok, err = try_call("gamepad.rescan", function()
-      return gamepad.rescan()
-    end)
-    if ok then
-      return true, "蓝牙重新扫描"
-    end
-    if err then
-      return nil, err
-    end
+  local sent, send_err = send_hidpad_command("rescan")
+  if not sent then
+    return nil, send_err
   end
-  return set_gamepad_enabled(true)
+  return true, "蓝牙手柄重新扫描"
 end
 
 local function set_brightness_level(level)
@@ -731,14 +994,14 @@ local function apply_selected_value(direction)
     else
       ok, message = cycle_wifi_mode()
     end
-  elseif item.id == "gamepad" then
+  elseif item.id == "hidpad" then
     if direction < 0 then
-      ok, message = set_gamepad_enabled(false)
+      ok, message = set_hidpad_enabled(false)
     else
       if item.value then
-        ok, message = reconnect_gamepad()
+        ok, message = rescan_hidpad()
       else
-        ok, message = set_gamepad_enabled(true)
+        ok, message = set_hidpad_enabled(true)
       end
     end
   elseif item.id == "brightness" then
@@ -806,10 +1069,14 @@ local function refresh_info_items()
     version = text_or(v, "--")
   end
 
-  local bluetooth = "--"
+  local bluetooth = "不支持"
   local gp = APP.items[2]
   if gp.available then
-    bluetooth = text_or(gp.name, text_or(gp.address, toggle_state_text(gp)))
+    bluetooth = toggle_state_text(gp)
+    local identity = hidpad_identity(gp.name, gp.address)
+    if identity ~= "" then
+      bluetooth = bluetooth .. " · " .. identity
+    end
   end
 
   local sd_text = "--"
@@ -824,7 +1091,7 @@ local function refresh_info_items()
     { name = "系统版本", value = version },
     { name = "Wi-Fi", value = APP.state.wifi_ssid },
     { name = "IP 地址", value = APP.state.ip_text },
-    { name = "蓝牙", value = bluetooth },
+    { name = "蓝牙手柄", value = bluetooth },
   }
 end
 
@@ -849,8 +1116,10 @@ local function build_settings_page()
     lv_obj_set_size(card.panel, 300, row_h[i])
     lv_obj_set_pos(card.panel, 10, row_y[i])
     disable_scroll(card.panel)
-    card.label = create_text(card.panel, item.title, FONT.label, C.text, 18, 7, 92)
-    card.value = create_text(card.panel, "", FONT.value, item.accent, 178, 7, 104, ALIGN_CENTER)
+    local card_font = item.id == "hidpad" and FONT.small or FONT.label
+    local value_font = item.id == "hidpad" and FONT.small or FONT.value
+    card.label = create_text(card.panel, item.title, card_font, C.text, 18, 7, 92)
+    card.value = create_text(card.panel, "", value_font, item.accent, 178, 7, 104, ALIGN_CENTER)
     if item.kind == "slider" then
       card.slider = lv_slider_create(card.panel)
       lv_obj_set_pos(card.slider, 18, 36)
@@ -1001,15 +1270,7 @@ function build_ui()
 end
 
 local function now_ms()
-  if sys and sys.millis then
-    local value = safe_call("sys.millis", function()
-      return sys.millis()
-    end)
-    if type(value) == "number" then
-      return value
-    end
-  end
-  return math.floor(os.clock() * 1000)
+  return clock_ms()
 end
 
 local function allow_key_event(evt_code, evt_type, ts_ms)
@@ -1193,6 +1454,11 @@ end
 function APP.stop(_reason)
   stop_timers()
   unbind_input()
+  if ipc and ipc.listen then
+    pcall(function()
+      ipc.listen(SETTINGS_HIDPAD_ENDPOINT, nil)
+    end)
+  end
   release_fonts()
 
   if lv_obj_clean and lv_scr_act then
@@ -1220,6 +1486,7 @@ local function boot()
   end
 
   init_fonts()
+  bind_hidpad_status()
   refresh_runtime_state()
   refresh_info_items()
   set_message(item_summary(current_item()))

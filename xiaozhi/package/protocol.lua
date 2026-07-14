@@ -27,6 +27,31 @@ local function pick_number(raw, name)
   return tonumber(raw:match('"' .. name .. '"%s*:%s*(%d+)') or "")
 end
 
+local function decode_json(raw)
+  if type(raw) ~= "string" or not sjson or not sjson.decode then
+    return nil
+  end
+  local ok, obj = pcall(sjson.decode, raw)
+  if ok and type(obj) == "table" then
+    return obj
+  end
+  return nil
+end
+
+local function json_string(obj, raw, name)
+  if type(obj) == "table" and type(obj[name]) == "string" then
+    return obj[name]
+  end
+  return pick_string(raw, name)
+end
+
+local function json_number(obj, raw, name)
+  if type(obj) == "table" and tonumber(obj[name]) then
+    return tonumber(obj[name])
+  end
+  return pick_number(raw, name)
+end
+
 local function u16be(value)
   value = tonumber(value) or 0
   local hi = math.floor(value / 256) % 256
@@ -109,63 +134,65 @@ function M.new(cfg)
   local function hello_json()
     return "{" ..
       json_pair("type", "hello") ..
-      ',"version":' .. tostring(cfg.websocket.version or 3) ..
+      ',"version":' .. tostring(cfg.websocket.version or 1) ..
       ',"features":{"mcp":true}' ..
       ',"transport":"websocket"' ..
-      ',"audio_params":{"format":"opus","sample_rate":' .. tostring(cfg.AUDIO.rate or 12000) ..
-      ',"channels":1,"frame_duration":' ..
+      ',"audio_params":{"format":"opus","sample_rate":' .. tostring(cfg.AUDIO.rate or 16000) ..
+      ',"channels":' .. tostring(cfg.AUDIO.channels or 1) .. ',"frame_duration":' ..
       tostring(cfg.AUDIO.frame_ms or 60) .. "}" ..
       "}"
   end
 
-  local function handle_hello(raw)
-    local transport = pick_string(raw, "transport")
+  local function handle_hello(raw, obj)
+    local transport = json_string(obj, raw, "transport")
     if transport and transport ~= "websocket" then
       set_error("unsupported transport")
       return
     end
-    self.session_id = pick_string(raw, "session_id") or self.session_id
-    self.server_sample_rate = pick_number(raw, "sample_rate") or self.server_sample_rate
-    self.server_frame_duration = pick_number(raw, "frame_duration") or self.server_frame_duration
+    self.session_id = json_string(obj, raw, "session_id") or self.session_id
+    local audio_params = type(obj) == "table" and obj.audio_params or nil
+    self.server_sample_rate = json_number(audio_params, raw, "sample_rate") or self.server_sample_rate
+    self.server_frame_duration = json_number(audio_params, raw, "frame_duration") or self.server_frame_duration
     self.opened = true
     self.connecting = false
     emit("opened")
   end
 
   local function handle_json(raw)
-    local typ = pick_string(raw, "type")
+    local obj = decode_json(raw)
+    local typ = json_string(obj, raw, "type")
     if typ == "hello" then
-      handle_hello(raw)
+      handle_hello(raw, obj)
       return
     end
     if typ == "tts" then
-      local state = pick_string(raw, "state")
+      local state = json_string(obj, raw, "state")
       if state == "start" then
         emit("tts_start")
       elseif state == "stop" then
         emit("tts_stop")
       elseif state == "sentence_start" then
-        emit("chat", "assistant", pick_string(raw, "text") or "")
+        emit("chat", "assistant", json_string(obj, raw, "text") or "")
       end
     elseif typ == "stt" then
-      emit("chat", "user", pick_string(raw, "text") or "")
+      emit("chat", "user", json_string(obj, raw, "text") or "")
     elseif typ == "llm" then
-      local emotion = pick_string(raw, "emotion")
+      local emotion = json_string(obj, raw, "emotion")
       if emotion then
         emit("emotion", emotion)
       end
     elseif typ == "alert" then
-      emit("alert", pick_string(raw, "status") or "alert",
-        pick_string(raw, "message") or "", pick_string(raw, "emotion") or "neutral")
+      emit("alert", json_string(obj, raw, "status") or "alert",
+        json_string(obj, raw, "message") or "", json_string(obj, raw, "emotion") or "neutral")
     elseif typ == "mcp" then
-      emit("mcp", raw)
+      emit("mcp", type(obj) == "table" and obj.payload or nil, raw)
     else
       emit("json", raw)
     end
   end
 
   local function parse_binary(data)
-    if (cfg.websocket.version or 3) == 3 and type(data) == "string" and #data >= 4 then
+    if (cfg.websocket.version or 1) == 3 and type(data) == "string" and #data >= 4 then
       local typ, _, hi, lo = string.byte(data, 1, 4)
       local size = (hi or 0) * 256 + (lo or 0)
       if typ == 0 and size > 0 and #data >= size + 4 then
@@ -209,7 +236,7 @@ function M.new(cfg)
     end
     local id, client_id = device_id(cfg)
     local headers = {
-      ["Protocol-Version"] = tostring(cfg.websocket.version or 3),
+      ["Protocol-Version"] = tostring(cfg.websocket.version or 1),
       ["Device-Id"] = id,
       ["Client-Id"] = client_id or id,
     }
@@ -286,7 +313,7 @@ function M.new(cfg)
       return false
     end
     local packet = opus
-    if (cfg.websocket.version or 3) == 3 then
+    if (cfg.websocket.version or 1) == 3 then
       packet = string.char(0, 0) .. u16be(#opus) .. opus
     end
     local ok, err = pcall(function()

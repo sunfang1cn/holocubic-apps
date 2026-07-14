@@ -6,7 +6,7 @@ if prev and prev.stop then
 end
 
 FLUID_PENDANT_APP = {
-  VERSION = "2026-07-13-dst-timezone-v1"
+  VERSION = "2026-07-14-lvgl-throttle-v1"
 }
 
 local APP = FLUID_PENDANT_APP
@@ -42,6 +42,7 @@ local app_on_fn = runtime_app and runtime_app.on or nil
 local runtime_tmr = rawget(_G, "tmr")
 local tmr_now_fn = runtime_tmr and runtime_tmr.now or nil
 local millis_fn = rawget(_G, "millis")
+local sleep_fn = rawget(_G, "sleep")
 local runtime_time = rawget(_G, "time")
 local time_getlocal_fn = runtime_time and runtime_time.getlocal or nil
 local time_settimezone_fn = runtime_time and runtime_time.settimezone or nil
@@ -82,7 +83,9 @@ local DISPLAY_OFF_THRESHOLD = 0.14
 local DISPLAY_EDGE_MARGIN = 0.03
 local DISPLAY_EDGE_CONFIRM_FRAMES = 2
 
-local TICK_MS = 25
+local TICK_MS = 28
+local LVGL_COMMAND_BATCH = 200
+local LVGL_BATCH_DELAY_MS = 1
 local GRAVITY = 16
 local TILT_FULL_SCALE_DEG = 45
 local IMU_X_SIGN = -1
@@ -155,6 +158,7 @@ local display_density = {}
 local display_lit = {}
 local display_edge_count = {}
 local display_count = 0
+local lvgl_draw_command_count = 0
 
 local invert_spacing = 1 / SPACING
 local particle_rest_density = 0
@@ -1781,6 +1785,16 @@ local function draw_rect(x, y, w, h, color, opa, radius)
     lv_canvas_draw_rect_fn(canvas, x, y, w, h, rect_dsc)
   elseif rect_mode == 2 then
     lv_canvas_draw_rect_fn(canvas, x, y, w, h, color, opa)
+  else
+    return
+  end
+
+  lvgl_draw_command_count = lvgl_draw_command_count + 1
+  if lvgl_draw_command_count >= LVGL_COMMAND_BATCH then
+    lvgl_draw_command_count = 0
+    if sleep_fn then
+      sleep_fn(LVGL_BATCH_DELAY_MS)
+    end
   end
 end
 
