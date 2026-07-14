@@ -1,5 +1,6 @@
 /*
  * Minimal self-contained crypto used by the AirPlay 1 compatibility module.
+ * Author: sunfang1cn@gmail.com
  *
  * AirPlay 1 receivers all use the same, publicly documented 2048-bit RSA key.
  * Keeping only N, D and Montgomery R^2 avoids pulling a second OS/entropy layer
@@ -491,15 +492,33 @@ void airplay_aes128_cbc_decrypt(const uint8_t key[16],
                                 uint8_t *output,
                                 size_t len)
 {
-    uint8_t round_key[176], previous[16], block[16];
-    size_t pos, i;
+    airplay_aes128_context_t ctx;
     if (!key || !iv || !input || !output || (len & 15u)) return;
-    aes_expand_key(key, round_key); bytes_copy(previous, iv, 16);
+    airplay_aes128_init(&ctx, key);
+    airplay_aes128_cbc_decrypt_ctx(&ctx, iv, input, output, len);
+    bytes_zero(&ctx, sizeof(ctx));
+}
+
+void airplay_aes128_init(airplay_aes128_context_t *ctx, const uint8_t key[16])
+{
+    if (!ctx || !key) return;
+    aes_expand_key(key, ctx->round_key);
+}
+
+void airplay_aes128_cbc_decrypt_ctx(const airplay_aes128_context_t *ctx,
+                                    const uint8_t iv[16],
+                                    const uint8_t *input,
+                                    uint8_t *output,
+                                    size_t len)
+{
+    uint8_t previous[16], block[16];
+    size_t pos, i;
+    if (!ctx || !iv || !input || !output || (len & 15u)) return;
+    bytes_copy(previous, iv, 16);
     for (pos=0;pos<len;pos+=16) {
-        aes_decrypt_block(input+pos,block,round_key);
+        aes_decrypt_block(input+pos,block,ctx->round_key);
         for(i=0;i<16;++i) output[pos+i]=block[i]^previous[i];
         bytes_copy(previous,input+pos,16);
     }
-    bytes_zero(round_key,sizeof(round_key)); bytes_zero(previous,sizeof(previous));
-    bytes_zero(block,sizeof(block));
+    bytes_zero(previous,sizeof(previous)); bytes_zero(block,sizeof(block));
 }

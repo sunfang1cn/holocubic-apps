@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Author: sunfang1cn@gmail.com
 """Build the freestanding crypto on Windows and check it against Python."""
 
 from __future__ import annotations

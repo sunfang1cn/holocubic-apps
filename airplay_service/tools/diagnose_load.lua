@@ -1,3 +1,4 @@
+-- Author: sunfang1cn@gmail.com
 -- Load the installed service inside DevRun so top-level Lua errors are
 -- observable even when the firmware service manager discards them.
 

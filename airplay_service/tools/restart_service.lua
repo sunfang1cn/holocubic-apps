@@ -1,3 +1,4 @@
+-- Author: sunfang1cn@gmail.com
 -- Restart the managed service with a short gap so the old TCP/UDP resources
 -- are released before the replacement instance binds its ports.
 

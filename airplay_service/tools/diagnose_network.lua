@@ -1,3 +1,4 @@
+-- Author: sunfang1cn@gmail.com
 -- Hold a directly loaded AirPlay service open briefly so a workstation can
 -- probe its RTSP listener. The managed service is restored before exit.
 

@@ -1,3 +1,5 @@
+-- Author: sunfang1cn@gmail.com
+
 local service = rawget(_G, "AIRPLAY_SERVICE")
 if not service then
   print("airplay_service: not running")

@@ -1,3 +1,5 @@
+/* Author: sunfang1cn@gmail.com */
+
 #ifndef AIRPLAY_CRYPTO_H
 #define AIRPLAY_CRYPTO_H
 
@@ -6,6 +8,11 @@
 
 #define AIRPLAY_RSA_BYTES 256u
 #define AIRPLAY_AES_BLOCK_BYTES 16u
+#define AIRPLAY_AES128_ROUND_KEY_BYTES 176u
+
+typedef struct airplay_aes128_context_t {
+    uint8_t round_key[AIRPLAY_AES128_ROUND_KEY_BYTES];
+} airplay_aes128_context_t;
 
 #if defined(_WIN32) && defined(AIRPLAY_CRYPTO_TEST)
 #define AIRPLAY_CRYPTO_API __declspec(dllexport)
@@ -29,5 +36,14 @@ AIRPLAY_CRYPTO_API void airplay_aes128_cbc_decrypt(const uint8_t key[16],
                                                    const uint8_t *input,
                                                    uint8_t *output,
                                                    size_t len);
+
+AIRPLAY_CRYPTO_API void airplay_aes128_init(airplay_aes128_context_t *ctx,
+                                            const uint8_t key[16]);
+
+AIRPLAY_CRYPTO_API void airplay_aes128_cbc_decrypt_ctx(const airplay_aes128_context_t *ctx,
+                                                       const uint8_t iv[16],
+                                                       const uint8_t *input,
+                                                       uint8_t *output,
+                                                       size_t len);
 
 #endif

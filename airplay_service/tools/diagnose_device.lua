@@ -1,3 +1,4 @@
+-- Author: sunfang1cn@gmail.com
 -- One-shot on-device diagnostic for HoloCubic's service manager.
 -- Intended to be launched temporarily through DevTools as the DevRun app.
 

@@ -1,3 +1,4 @@
+# Author: sunfang1cn@gmail.com
 """Query and observe RAOP multicast DNS packets on the device LAN."""
 
 from __future__ import annotations

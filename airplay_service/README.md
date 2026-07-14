@@ -1,5 +1,7 @@
 # airplay_service
 
+作者：sunfang1cn@gmail.com
+
 `airplay_service` 是 HoloCubic ESP32-S3 的后台 AirPlay 1（RAOP）音频接收服务。设备联网后自动发布 AirPlay 音箱；没有 AirPlay 会话时只监听网络，不启动 I2S，因此原来的本地音乐 App 和启动页面仍可正常使用。
 
 ## 已实现
@@ -10,9 +12,9 @@
 - Apple-Challenge 的 RSA PKCS#1 v1.5 响应。
 - `rsaaeskey` 的 RSA-OAEP/SHA-1 解封装和 AirPlay AES-128-CBC 解密。
 - Apple Lossless（ALAC）和未加密 L16/44.1 kHz/16-bit 播放。
-- 128 包 PSRAM 抖动缓冲、乱序处理、预读缺口重传、自适应补帧和高水位追帧恢复。
+- 512 包 PSRAM 抖动缓冲、乱序处理、预读缺口重传、自适应补帧和高水位追帧恢复。
 - ALAC/AES 生产者与 I2S 消费者双任务流水线；Lua 网络回调只解析 RTP 头并复制数据。
-- 32 包 PCM 环形队列、双核任务分配和 AES 逆变换只读查表优化。
+- 256 包 PCM 环形队列、双核任务分配和 AES 逆变换只读查表优化。
 - DMAP 标题、歌手、专辑，播放进度、音量和封面类型/大小解析。
 - 左右声道峰值、播放状态和统计数据接口，供音乐 App 后续展示元数据、按曲目匹配歌词或绘制可视化。
 - 热重载以及 socket、timer、I2S、任务和解码器释放。
@@ -43,9 +45,9 @@ autostart_service = true
 
 服务会在 Wi-Fi 获得 IPv4 地址后开始广播。后台 service VM 没有 `wifi` 全局时，会自动读取固件本机 `/api/system/state` 获取 STA 地址。默认名称为 `HoloCubic`，RTSP 端口为 5000，I2S 数据引脚为 48；可以用 `config.lua` 覆盖。也可以在特殊网络环境中用 `ip = "192.168.1.123"` 显式指定地址。
 
-默认实时参数为 48 个 ALAC 包预缓冲（约 384 ms）、32 包 PCM 队列和 12×512 I2S DMA。ALAC/AES 生产者固定在 core 1，I2S 消费者固定在 core 0，优先级分别为 8/9。零星缺包时最多等待 12 个重试周期；PCM 队列降到 24 包后立即停止等待并补一个 8 ms 静音帧，避免长时间 Wi-Fi 阻塞拖空 I2S。RTP 缓冲异常逼近容量时会跳到最新安全窗口，避免进入持续溢出状态。
+默认实时参数为 160 个 ALAC 包预缓冲（约 1.28 s）、256 包 PCM 队列和 12×512 I2S DMA。ALAC/AES 生产者允许调度器选择核心，I2S 消费者固定在 core 0，优先级分别为 10/11。零星缺包时最多等待 192 个 2 ms 周期（约 384 ms）；PCM 队列降到 24 包后立即停止等待并补一个 8 ms 静音帧，避免长时间 Wi-Fi 阻塞拖空 I2S。RTP 序列跨度超过 192 包时会跳到最新安全窗口，避免进入持续覆盖状态。
 
-原生核心需要 PSRAM。固定 RTP 缓冲约占 264 KB，PCM 队列约占 66 KB，此外还有 ALAC 解码器和临时缓冲。服务空闲时不会申请这些流缓冲，也不会占用 I2S。
+原生核心需要 PSRAM。固定 RTP 缓冲约占 1.01 MiB，PCM 队列约占 514 KiB，此外还有 ALAC 解码器和临时缓冲。服务空闲时不会申请这些流缓冲，也不会占用 I2S。
 
 ## UI/状态接口
 
@@ -131,6 +133,7 @@ python airplay_service/tools/raop_pcm_probe.py 192.168.1.123
 ## 已知限制
 
 - mDNS 使用 Lua UDP 实现；如果固件自带 mDNS 已占用 5353，服务仍会主动广播，但无法直接接收查询并即时响应。
+- 固件提供给动态模块的 ABI 没有网络/socket 接口，音频包和重传请求必须经过 Lua 事件循环。前台 App 长时间阻塞 Lua 或弱 Wi-Fi 导致数据在回调前丢失时，原生解码和扩大缓冲无法完全补救。
 - 音频时钟目前由接收端 I2S 和 11025-frame latency 缓冲驱动，没有做长期的 NTP/采样率漂移校正。长时间播放需要真机观察是否要加微量重采样。
 - 固定抖动缓冲最大接受 2048 字节 RTP payload；标准 AirPlay 1 的 352-frame ALAC 包在此范围内。
 - 当前只允许一个发送端会话。

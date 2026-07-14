@@ -1,4 +1,5 @@
 -- HoloCubic AirPlay 1 / RAOP background service.
+-- Author: sunfang1cn@gmail.com
 --
 -- The Lua layer owns discovery, RTSP, metadata and UDP socket callbacks.  It
 -- can play an unencrypted L16 stream without a native module.  The bundled
@@ -12,7 +13,7 @@ end
 local configured = rawget(_G, "AIRPLAY_SERVICE_CONFIG")
 
 AIRPLAY_SERVICE = {
-  VERSION = "0.3.0",
+  VERSION = "0.3.15",
   APP_DIR = "/sd/apps/airplay_service",
   MODULE_PATH = "/sd/apps/airplay_service/modules/airplay_core.so",
   STATUS_PATH = "/sd/apps/airplay_service/status.json",
@@ -36,6 +37,7 @@ local APP = AIRPLAY_SERVICE
 local defaults = {
   name = "HoloCubic",
   rtsp_port = 5000,
+  rtsp_idle_timeout_s = 7200,
   audio_port = 6000,
   control_port = 6001,
   timing_port = 6002,
@@ -46,15 +48,18 @@ local defaults = {
   bits = 16,
   dma_buffer_count = 12,
   dma_buffer_len = 512,
-  prebuffer_packets = 48,
+  prebuffer_packets = 160,
   max_jitter_packets = 96,
-  missing_wait_ticks = 12,
-  audio_task_priority = 8,
-  audio_task_core = 1,
+  missing_wait_ticks = 192,
+  audio_task_priority = 10,
+  audio_task_core = -1,
   output_task_core = 0,
   mdns_interval_ms = 30000,
   network_poll_ms = 2000,
   drain_interval_ms = 10,
+  timing_poll_ms = 100,
+  timing_initial_interval_ms = 300,
+  timing_interval_ms = 3000,
   debug = false,
   ip = nil,
 }
@@ -98,8 +103,26 @@ APP.state = {
   alac_available = false,
   encryption_available = false,
   focus_conflict = false,
+  last_rtsp_method = nil,
+  last_rtsp_ms = nil,
+  last_rtsp_response_method = nil,
+  last_rtsp_response_code = nil,
+  last_rtsp_response_queued_ms = nil,
+  last_rtsp_response_sent_ms = nil,
+  last_rtsp_send_error = nil,
+  last_disconnect_pending_responses = 0,
+  last_session_end = nil,
+  last_session_end_ms = nil,
+  last_timing_response_ms = nil,
+  last_timing_roundtrip_ms = nil,
+  last_sync_ms = nil,
+  sync_rtp_timestamp = nil,
+  sync_latency_frames = nil,
   metrics = {
     rtsp_requests = 0,
+    rtsp_responses_queued = 0,
+    rtsp_responses_sent = 0,
+    rtsp_send_errors = 0,
     rtp_received = 0,
     rtp_written = 0,
     rtp_lost = 0,
@@ -107,6 +130,9 @@ APP.state = {
     rtp_dropped = 0,
     resend_requests = 0,
     bytes_received = 0,
+    timing_requests = 0,
+    timing_responses = 0,
+    sync_packets = 0,
   },
 }
 
@@ -265,6 +291,7 @@ local function safe_close(obj)
   pcall(function()
     if obj.on then
       obj:on("receive", nil)
+      obj:on("sent", nil)
       obj:on("disconnection", nil)
     end
   end)
@@ -513,6 +540,17 @@ end
 
 local function reset_metrics()
   for key in pairs(S.metrics) do S.metrics[key] = 0 end
+  S.last_rtsp_response_method = nil
+  S.last_rtsp_response_code = nil
+  S.last_rtsp_response_queued_ms = nil
+  S.last_rtsp_response_sent_ms = nil
+  S.last_rtsp_send_error = nil
+  S.last_disconnect_pending_responses = 0
+  S.last_timing_response_ms = nil
+  S.last_timing_roundtrip_ms = nil
+  S.last_sync_ms = nil
+  S.sync_rtp_timestamp = nil
+  S.sync_latency_frames = nil
 end
 
 local function new_jitter()
@@ -586,7 +624,7 @@ end
 local function send_resend(seq, count)
   local session = APP.session
   if not APP.control_socket or not session or not session.client_ip or
-     not session.client_control_port then return end
+     not session.client_control_port then return false end
   session.resend_seq = ((session.resend_seq or 0) + 1) % 65536
   local packet = string.char(0x80, 0xd5) .. u16be(session.resend_seq) ..
                  u16be(seq) .. u16be(count or 1)
@@ -594,9 +632,25 @@ local function send_resend(seq, count)
     APP.control_socket:send(session.client_control_port, session.client_ip, packet)
   end)
   if ok then S.metrics.resend_requests = S.metrics.resend_requests + 1 end
+  return ok
 end
 
 local function queue_rtp(packet, source_ip)
+  if source_ip and APP.session and APP.session.client_ip ~= source_ip then
+    APP.session.client_ip = source_ip
+    S.client_ip = source_ip
+  end
+  if APP.core and APP.core.ingest_rtp then
+    local resend_sequence, resend_count, resend_serial =
+      APP.core.ingest_rtp(packet, tonumber(APP.core_resend_serial) or 0)
+    resend_serial = tonumber(resend_serial)
+    if resend_serial and resend_serial ~= APP.core_resend_serial and
+       resend_sequence and send_resend(tonumber(resend_sequence),
+                                       tonumber(resend_count) or 1) then
+      APP.core_resend_serial = resend_serial
+    end
+    return
+  end
   S.metrics.bytes_received = S.metrics.bytes_received + #packet
   if APP.core and APP.core.push_rtp then
     local ok, accepted, err = pcall(APP.core.push_rtp, packet)
@@ -639,10 +693,6 @@ local function queue_rtp(packet, source_ip)
   j.count = j.count + 1
   if not j.first_seq then j.first_seq = rtp.seq end
   S.metrics.rtp_received = S.metrics.rtp_received + 1
-  if source_ip and APP.session then
-    APP.session.client_ip = source_ip
-    S.client_ip = source_ip
-  end
 end
 
 local function claim_audio_focus()
@@ -719,16 +769,34 @@ end
 local function drain_audio()
   if not APP.running or not APP.output_owned then return end
   if APP.core then
-    if APP.core.state then
+    if APP.core.poll then
+      local left, right, playing, resend_serial, resend_sequence, resend_count = APP.core.poll()
+      S.level_left = tonumber(left) or S.level_left
+      S.level_right = tonumber(right) or S.level_right
+      resend_serial = tonumber(resend_serial)
+      if resend_serial and resend_serial ~= APP.core_resend_serial then
+        if resend_serial > 0 and resend_sequence then
+          if send_resend(tonumber(resend_sequence), tonumber(resend_count) or 1) then
+            APP.core_resend_serial = resend_serial
+          end
+        else
+          APP.core_resend_serial = resend_serial
+        end
+      end
+      if playing and S.phase ~= "playing" then set_phase("playing") end
+    elseif APP.core.state then
       local ok, value = pcall(APP.core.state)
       if ok and type(value) == "table" then
         S.level_left = tonumber(value.left) or S.level_left
         S.level_right = tonumber(value.right) or S.level_right
         local resend_serial = tonumber(value.resend_serial)
         if resend_serial and resend_serial ~= APP.core_resend_serial then
-          APP.core_resend_serial = resend_serial
           if resend_serial > 0 and value.resend_sequence then
-            send_resend(tonumber(value.resend_sequence), 1)
+            if send_resend(tonumber(value.resend_sequence), tonumber(value.resend_count) or 1) then
+              APP.core_resend_serial = resend_serial
+            end
+          else
+            APP.core_resend_serial = resend_serial
           end
         end
         if value.playing and S.phase ~= "playing" then set_phase("playing") end
@@ -779,6 +847,10 @@ end
 
 local function reset_session(reason)
   stop_output()
+  if reason ~= "network stopped" then
+    S.last_session_end = reason
+    S.last_session_end_ms = now_ms()
+  end
   APP.session = nil
   APP.active_ctx = nil
   S.client_ip, S.session_id, S.codec = nil, nil, nil
@@ -840,6 +912,36 @@ local reason_phrases = {
   [454] = "Session Not Found", [500] = "Internal Server Error",
 }
 
+local function finish_response(ctx, item)
+  ctx.sending_response = false
+  ctx.current_response = nil
+  S.metrics.rtsp_responses_sent = S.metrics.rtsp_responses_sent + 1
+  S.last_rtsp_response_method = item.method
+  S.last_rtsp_response_code = item.code
+  S.last_rtsp_response_sent_ms = now_ms()
+  if item.after_send then pcall(item.after_send) end
+end
+
+local function pump_response(ctx)
+  if ctx.closed or ctx.sending_response or not ctx.response_queue or
+     #ctx.response_queue == 0 then return end
+  local item = table.remove(ctx.response_queue, 1)
+  ctx.sending_response = true
+  ctx.current_response = item
+  local ok, err = pcall(function() ctx.socket:send(item.data) end)
+  if ok then return end
+
+  ctx.sending_response = false
+  ctx.current_response = nil
+  S.metrics.rtsp_send_errors = S.metrics.rtsp_send_errors + 1
+  S.last_rtsp_send_error = tostring(err)
+  if item.after_send then pcall(item.after_send) end
+  ctx.closed = true
+  APP.clients[ctx.socket] = nil
+  safe_close(ctx.socket)
+  if APP.session and ctx.session_id == S.session_id then reset_session("send error") end
+end
+
 local function send_response(ctx, request, code, headers, body, after_send)
   headers = headers or {}
   body = body or ""
@@ -851,10 +953,25 @@ local function send_response(ctx, request, code, headers, body, after_send)
   lines[#lines + 1] = ""
   lines[#lines + 1] = body
   local response = table.concat(lines, "\r\n")
-  local ok = pcall(function()
-    ctx.socket:send(response, after_send)
-  end)
-  if not ok and after_send then pcall(after_send) end
+  ctx.response_queue = ctx.response_queue or {}
+  if #ctx.response_queue >= 64 then
+    S.metrics.rtsp_send_errors = S.metrics.rtsp_send_errors + 1
+    S.last_rtsp_send_error = "RTSP response queue full"
+    ctx.closed = true
+    APP.clients[ctx.socket] = nil
+    safe_close(ctx.socket)
+    if APP.session and ctx.session_id == S.session_id then reset_session("send queue full") end
+    return
+  end
+  ctx.response_queue[#ctx.response_queue + 1] = {
+    data = response,
+    after_send = after_send,
+    method = request.method or "UNKNOWN",
+    code = code,
+  }
+  S.metrics.rtsp_responses_queued = S.metrics.rtsp_responses_queued + 1
+  S.last_rtsp_response_queued_ms = now_ms()
+  pump_response(ctx)
 end
 
 local function parse_text_parameters(body)
@@ -927,6 +1044,7 @@ local function configure_session(sdp)
   S.codec = sdp.codec
   S.sample_rate = sdp.sample_rate
   S.channels = sdp.channels
+  APP.core_resend_serial = 0
   clear_jitter()
   return true
 end
@@ -934,6 +1052,9 @@ end
 local function handle_rtsp(ctx, request)
   S.metrics.rtsp_requests = S.metrics.rtsp_requests + 1
   local method = request.method
+  ctx.last_method = method
+  S.last_rtsp_method = method
+  S.last_rtsp_ms = now_ms()
   log(method, request.uri)
 
   if method == "OPTIONS" then
@@ -948,6 +1069,7 @@ local function handle_rtsp(ctx, request)
       send_response(ctx, request, 453, { ["X-AirPlay-Error"] = "another sender is active" })
       return
     end
+    if ctx.peer_ip then S.client_ip = ctx.peer_ip end
     local sdp = parse_sdp(request.body)
     local ok, err = configure_session(sdp)
     if not ok then
@@ -970,6 +1092,9 @@ local function handle_rtsp(ctx, request)
     local transport = parse_transport(request.headers["transport"])
     APP.session.client_control_port = tonumber(transport.control_port)
     APP.session.client_timing_port = tonumber(transport.timing_port)
+    APP.session.timing_request_count = 0
+    APP.session.last_timing_request_ms = nil
+    APP.session.timing_active = false
     send_response(ctx, request, 200, {
       ["Transport"] = "RTP/AVP/UDP;unicast;mode=record;server_port=" .. APP.config.audio_port ..
         ";control_port=" .. APP.config.control_port .. ";timing_port=" .. APP.config.timing_port,
@@ -986,6 +1111,7 @@ local function handle_rtsp(ctx, request)
       send_response(ctx, request, 453, { ["X-AirPlay-Error"] = err })
       return
     end
+    APP.session.timing_active = true
     set_phase("buffering")
     send_response(ctx, request, 200, { ["Audio-Latency"] = "11025" })
     return
@@ -1024,6 +1150,8 @@ local function handle_rtsp(ctx, request)
 
   if method == "TEARDOWN" then
     send_response(ctx, request, 200, nil, nil, function()
+      ctx.closed = true
+      APP.clients[ctx.socket] = nil
       reset_session("teardown")
       safe_close(ctx.socket)
     end)
@@ -1088,10 +1216,30 @@ local function on_tcp_receive(ctx, data)
 end
 
 local function on_connection(socket)
-  local ctx = { socket = socket, buffer = "" }
+  local ctx = {
+    socket = socket,
+    buffer = "",
+    response_queue = {},
+    sending_response = false,
+    current_response = nil,
+    closed = false,
+  }
+  if socket.getpeer then
+    local ok, _, peer_ip = pcall(function() return socket:getpeer() end)
+    if ok and type(peer_ip) == "string" then ctx.peer_ip = peer_ip end
+  end
   APP.clients[socket] = ctx
+  socket:on("sent", function()
+    if ctx.closed or not ctx.sending_response or not ctx.current_response then return end
+    local item = ctx.current_response
+    finish_response(ctx, item)
+    pump_response(ctx)
+  end)
   socket:on("receive", function(_, data) on_tcp_receive(ctx, data) end)
   socket:on("disconnection", function()
+    ctx.closed = true
+    local pending = #(ctx.response_queue or {}) + (ctx.current_response and 1 or 0)
+    S.last_disconnect_pending_responses = pending
     APP.clients[socket] = nil
     if APP.session and ctx.session_id == S.session_id then reset_session("disconnect") end
   end)
@@ -1110,6 +1258,18 @@ local function on_timing(sock, data, port, ip)
     APP.session.client_ip = ip
     S.client_ip = ip
   end
+  local packet_type = data:byte(2)
+  if packet_type == 0xd3 or packet_type == 0x53 then
+    S.metrics.timing_responses = S.metrics.timing_responses + 1
+    local now = now_ms()
+    S.last_timing_response_ms = now
+    if APP.session and APP.session.last_timing_request_ms then
+      S.last_timing_roundtrip_ms = math.max(0,
+        elapsed_ms(now, APP.session.last_timing_request_ms))
+    end
+    return
+  end
+  if packet_type ~= 0xd2 and packet_type ~= 0x52 then return end
   local stamp = ntp_now()
   local response = string.char(0x80, 0xd3) .. data:sub(3, 4) .. "\0\0\0\0" ..
                    data:sub(25, 32) .. stamp .. stamp
@@ -1123,7 +1283,43 @@ local function on_control(_, data, _, ip)
     S.client_ip = ip
   end
   local payload_type = (data:byte(2) or 0) & 0x7f
-  if payload_type == 0x56 and #data > 4 then queue_rtp(data:sub(5), ip) end
+  if payload_type == 0x56 and #data > 4 then
+    queue_rtp(data:sub(5), ip)
+  elseif payload_type == 0x54 and #data >= 20 then
+    S.metrics.sync_packets = S.metrics.sync_packets + 1
+    S.last_sync_ms = now_ms()
+    local timestamp_less_latency = read_u32(data, 5)
+    local timestamp = read_u32(data, 17)
+    S.sync_rtp_timestamp = timestamp
+    if timestamp and timestamp_less_latency then
+      S.sync_latency_frames = (timestamp - timestamp_less_latency) % 4294967296
+    end
+  end
+end
+
+local function poll_timing()
+  local session = APP.session
+  if not APP.running or not session or not session.timing_active then return end
+  local port = tonumber(session.client_timing_port)
+  local ip = session.client_ip or S.client_ip
+  if not APP.timing_socket or not port or not ip then return end
+
+  local count = tonumber(session.timing_request_count) or 0
+  local interval = count < 3 and APP.config.timing_initial_interval_ms or
+                   APP.config.timing_interval_ms
+  local now = now_ms()
+  if session.last_timing_request_ms and
+     elapsed_ms(now, session.last_timing_request_ms) < interval then return end
+
+  -- Classic RAOP timing request: RTCP-like leader/type, fixed sequence 7,
+  -- followed by a zero filler and three zero NTP timestamps.
+  local request = string.char(0x80, 0xd2) .. u16be(7) .. string.rep("\0", 28)
+  local ok = pcall(function() APP.timing_socket:send(port, ip, request) end)
+  if ok then
+    session.timing_request_count = count + 1
+    session.last_timing_request_ms = now
+    S.metrics.timing_requests = S.metrics.timing_requests + 1
+  end
 end
 
 local function create_udp(port, callback)
@@ -1178,7 +1374,7 @@ local function start_network(ip)
     APP.control_socket = create_udp(APP.config.control_port, on_control)
     APP.timing_socket = create_udp(APP.config.timing_port, on_timing)
     APP.mdns_socket = create_mdns_socket()
-    APP.rtsp_server = net.createServer(net.TCP, 0)
+    APP.rtsp_server = net.createServer(net.TCP, APP.config.rtsp_idle_timeout_s)
     APP.rtsp_server:listen(APP.config.rtsp_port, on_connection)
   end)
   if not ok then
@@ -1286,6 +1482,7 @@ local startup_ok, startup_error = pcall(function()
   load_native_core()
   register_status_route()
   add_timer(APP.config.drain_interval_ms, tmr.ALARM_AUTO, drain_audio)
+  add_timer(APP.config.timing_poll_ms, tmr.ALARM_AUTO, poll_timing)
   add_timer(APP.config.network_poll_ms, tmr.ALARM_AUTO, poll_network)
   add_timer(APP.config.mdns_interval_ms, tmr.ALARM_AUTO, function() send_mdns(120) end)
   poll_network()
