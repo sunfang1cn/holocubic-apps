@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=320,height=240,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>WiFi Setting Guide</title>
+<style>
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #000;
+  color: #f7fbff;
+  font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+}
+
+.screen {
+  position: relative;
+  width: 320px;
+  height: 240px;
+  overflow: hidden;
+  background: #000;
+}
+
+.status-dot {
+  position: absolute;
+  left: 14px;
+  top: 13px;
+  width: 8px;
+  height: 8px;
+  border-radius: 4px;
+  background: #22d3ee;
+  box-shadow: 0 0 9px rgba(34, 211, 238, 0.9);
+  animation: breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+.eyebrow {
+  position: absolute;
+  left: 28px;
+  top: 10px;
+  width: 156px;
+  height: 14px;
+  color: #8cecf2;
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 1px;
+}
+
+.title {
+  position: absolute;
+  left: 14px;
+  top: 29px;
+  width: 190px;
+  height: 28px;
+  font-size: 22px;
+  line-height: 28px;
+  font-weight: 700;
+}
+
+.description {
+  position: absolute;
+  left: 14px;
+  top: 61px;
+  width: 292px;
+  height: 30px;
+  color: #9fb0be;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.setup-card {
+  position: absolute;
+  left: 14px;
+  top: 96px;
+  width: 190px;
+  height: 126px;
+  border: 1px solid rgba(148, 181, 199, 0.18);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.label {
+  position: absolute;
+  left: 10px;
+  width: 62px;
+  height: 16px;
+  color: #718695;
+  font-size: 9px;
+  line-height: 16px;
+}
+
+.value {
+  position: absolute;
+  left: 69px;
+  width: 110px;
+  height: 16px;
+  overflow: hidden;
+  color: #edf8ff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ssid-label, .ssid-value { top: 8px; }
+.portal-label, .portal-value { top: 33px; }
+
+.ssid-value {
+  color: #8cecf2;
+  font-weight: 700;
+}
+
+.portal-value {
+  color: #67e8f9;
+  font-weight: 700;
+}
+
+.divider {
+  position: absolute;
+  left: 10px;
+  width: 169px;
+  height: 1px;
+  background: rgba(148, 181, 199, 0.12);
+}
+
+.divider-1 { top: 30px; }
+.divider-2 { top: 55px; }
+
+.step {
+  position: absolute;
+  left: 10px;
+  width: 169px;
+  height: 22px;
+}
+
+.step-1 { top: 63px; }
+.step-2 { top: 91px; }
+
+.step-number {
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 9px;
+  background: rgba(34, 211, 238, 0.1);
+  color: #67e8f9;
+  font-size: 9px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.step-text {
+  position: absolute;
+  left: 25px;
+  top: 0;
+  width: 144px;
+  height: 22px;
+  color: #a9bac6;
+  font-size: 9px;
+  line-height: 11px;
+}
+
+.qr-card {
+  position: absolute;
+  left: 206px;
+  top: 96px;
+  width: 104px;
+  height: 126px;
+  border: 1px solid rgba(103, 232, 249, 0.24);
+  border-radius: 10px;
+  background: rgba(10, 25, 34, 0.88);
+}
+
+.qr-wrap {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 100px;
+  height: 100px;
+  padding: 12px;
+  border-radius: 5px;
+  background: #fff;
+}
+
+.qr-image {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  width: 76px;
+  height: 76px;
+  image-rendering: pixelated;
+}
+
+.qr-title {
+  position: absolute;
+  left: 4px;
+  top: 102px;
+  width: 96px;
+  height: 13px;
+  color: #dffbff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 13px;
+  text-align: center;
+}
+
+.qr-note {
+  position: absolute;
+  left: 4px;
+  top: 114px;
+  width: 96px;
+  height: 11px;
+  overflow: hidden;
+  color: #66808f;
+  font-size: 8px;
+  line-height: 9px;
+  text-align: center;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<main class="screen">
+  <div class="status-dot"></div>
+  <div class="eyebrow">WAITING FOR NETWORK</div>
+  <div class="title">等待配网</div>
+  <div class="description">连接设备热点，然后打开配网页面完成 WiFi 设置</div>
+
+  <section class="setup-card" aria-label="配网信息">
+    <div class="label ssid-label">设备热点</div>
+    <div class="value ssid-value" id="setupSsid">clocteck-cubic</div>
+    <div class="divider divider-1"></div>
+
+    <div class="label portal-label">配网地址</div>
+    <div class="value portal-value" id="setupPortal">192.168.18.1</div>
+    <div class="divider divider-2"></div>
+
+    <div class="step step-1">
+      <div class="step-number">1</div>
+      <div class="step-text">手机或电脑连接上方<br>设备热点</div>
+    </div>
+    <div class="step step-2">
+      <div class="step-number">2</div>
+      <div class="step-text">等待自动弹出页面，或<br>扫码打开配网地址</div>
+    </div>
+  </section>
+
+  <section class="qr-card" aria-label="配网页面二维码">
+    <div class="qr-wrap">
+      <img class="qr-image" id="portalQr" alt="配网页面二维码">
+    </div>
+    <div class="qr-title">扫码打开配网页</div>
+    <div class="qr-note" id="qrTarget">http://192.168.18.1/</div>
+  </section>
+</main>
+
+<script>
+const params = new URLSearchParams(location.search);
+const ssid = params.get("ssid") || "clocteck-cubic";
+const portal = params.get("portal") || "192.168.18.1";
+const target = /^https?:\/\//i.test(portal) ? portal : `http://${portal}/`;
+
+document.getElementById("setupSsid").textContent = ssid;
+document.getElementById("setupPortal").textContent = portal;
+document.getElementById("qrTarget").textContent = target;
+document.getElementById("portalQr").src =
+  `https://api.qrserver.com/v1/create-qr-code/?size=132x132&margin=0&data=${encodeURIComponent(target)}`;
+</script>
+</body>
+</html>

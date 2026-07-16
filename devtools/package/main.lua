@@ -1,15 +1,18 @@
 -- DevTools service: SD file manager + dedicated DevRun code runner.
 
-if _G.DEVTOOLS and _G.DEVTOOLS.stop then
-  pcall(function() _G.DEVTOOLS.stop("reload") end)
+local PREVIOUS_DEVTOOLS = _G.DEVTOOLS
+if PREVIOUS_DEVTOOLS and PREVIOUS_DEVTOOLS.stop then
+  pcall(function() PREVIOUS_DEVTOOLS.stop("reload") end)
 end
 
 DEVTOOLS = {}
 local APP = DEVTOOLS
 
-APP.VERSION = "2026-07-14-devtools-folder-transfer-v4"
+APP.VERSION = "2026-07-15-devtools-folder-transfer-v6"
 APP.ROOT_PATH = "/sd"
 APP.APPS_PATH = "/sd/apps"
+APP.SERVICE_ID = "devtools"
+APP.SERVICE_MAIN = "/sd/apps/devtools/main.lua"
 APP.RUN_APP_ID = "devrun"
 APP.RUN_APP_DIR = "/sd/apps/devrun"
 APP.RUN_APP_MAIN = "/sd/apps/devrun/main.lua"
@@ -27,6 +30,20 @@ APP.logs = {}
 APP.request_count = 0
 APP.last_action = "idle"
 APP.shutting_down = false
+local previous_generation = type(PREVIOUS_DEVTOOLS) == "table" and tonumber(PREVIOUS_DEVTOOLS.generation) or 0
+local global_generation = tonumber(_G.DEVTOOLS_GENERATION) or 0
+APP.generation = math.max(previous_generation, global_generation) + 1
+_G.DEVTOOLS_GENERATION = APP.generation
+APP.started_at = 0
+if tmr and type(tmr.now) == "function" then
+  local ok_now, now = pcall(tmr.now)
+  if ok_now then
+    APP.started_at = tonumber(now) or 0
+  end
+end
+APP.reload_pending = false
+APP.reload_error = ""
+APP.reload_timer = nil
 
 local function text_or(value, fallback)
   if value == nil then
@@ -640,8 +657,83 @@ function APP.api_info()
     preview_media_limit = APP.PREVIEW_MEDIA_LIMIT,
     run_app_id = APP.RUN_APP_ID,
     run_app_main = APP.RUN_APP_MAIN,
+    generation = APP.generation,
+    started_at = APP.started_at,
+    reload_available = tmr and type(tmr.create) == "function" and app and type(app.start_service) == "function" or false,
+    reload_pending = APP.reload_pending,
+    reload_error = APP.reload_error,
     request_count = APP.request_count,
     last_action = APP.last_action
+  })
+end
+
+function APP.api_reload()
+  if APP.reload_pending then
+    return error_response("409 Conflict", "DevTools reload already pending")
+  end
+  if APP.shutting_down then
+    return error_response("409 Conflict", "DevTools is shutting down")
+  end
+
+  local st = file.stat(APP.SERVICE_MAIN)
+  if not st or st.is_dir then
+    return error_response("404 Not Found", "DevTools main.lua not found")
+  end
+  if not (tmr and type(tmr.create) == "function") then
+    return error_response("501 Not Implemented", "timer API unavailable; reboot the device to apply updates")
+  end
+  if not (app and type(app.start_service) == "function") then
+    return error_response("501 Not Implemented", "service restart API unavailable; reboot the device to apply updates")
+  end
+
+  if type(loadfile) == "function" then
+    local ok_compile, chunk, compile_err = pcall(loadfile, APP.SERVICE_MAIN)
+    if not ok_compile then
+      return error_response("422 Unprocessable Entity", "DevTools compile check failed: " .. text_or(chunk, "unknown error"))
+    end
+    if type(chunk) ~= "function" then
+      return error_response("422 Unprocessable Entity", "DevTools compile check failed: " .. text_or(compile_err, "unknown error"))
+    end
+  end
+
+  local timer = tmr.create()
+  if not timer then
+    return error_response("500 Internal Server Error", "failed to create reload timer")
+  end
+
+  APP.reload_pending = true
+  APP.reload_error = ""
+  APP.reload_timer = timer
+  local ok_alarm, alarm_err = pcall(function()
+    timer:alarm(250, tmr.ALARM_SINGLE or 0, function()
+      if APP.reload_timer == timer then
+        APP.reload_timer = nil
+      end
+      pcall(function() timer:unregister() end)
+      local ok_reload, restarted, reload_err = pcall(app.start_service, APP.SERVICE_ID)
+      if not ok_reload or not restarted then
+        APP.reload_pending = false
+        APP.reload_error = text_or(ok_reload and reload_err or restarted, "service restart failed")
+        print("[devtools] reload failed", APP.reload_error)
+      end
+    end)
+  end)
+  if not ok_alarm then
+    APP.reload_pending = false
+    APP.reload_timer = nil
+    pcall(function() timer:unregister() end)
+    return error_response("500 Internal Server Error", "failed to schedule reload: " .. text_or(alarm_err, "unknown error"))
+  end
+
+  mark_action("reload", APP.SERVICE_MAIN)
+  update_screen()
+  return json_response("202 Accepted", {
+    ok = true,
+    scheduled = true,
+    reload_in_ms = 250,
+    service_id = APP.SERVICE_ID,
+    version = APP.VERSION,
+    generation = APP.generation
   })
 end
 
@@ -1014,6 +1106,40 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.secondary{background:#eef5ff;border-color:#cddcff;color:#1f4aa5}
 button.danger{background:#fff1f4;border-color:#f3c7d0;color:var(--danger)}
 button.warn{background:#fff6e8;border-color:#efdab4;color:var(--warn)}
+.upload-picker{position:relative}
+.upload-picker>summary{
+  list-style:none;
+  min-height:40px;
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  border:1px solid var(--accent);
+  border-radius:10px;
+  background:var(--accent);
+  color:#fff;
+  padding:8px 12px;
+  cursor:pointer;
+  user-select:none;
+}
+.upload-picker>summary::-webkit-details-marker{display:none}
+.upload-picker>summary::after{content:"▾";font-size:11px;transition:transform .14s ease}
+.upload-picker[open]>summary::after{transform:rotate(180deg)}
+.upload-picker>summary:hover{box-shadow:0 8px 18px rgba(37,99,235,.18)}
+.upload-options{
+  position:absolute;
+  z-index:30;
+  top:calc(100% + 6px);
+  left:0;
+  min-width:150px;
+  display:grid;
+  gap:6px;
+  padding:7px;
+  border:1px solid var(--line);
+  border-radius:11px;
+  background:#fff;
+  box-shadow:var(--shadow);
+}
+.upload-options button{width:100%;text-align:left;white-space:nowrap}
 .app{max-width:1440px;margin:0 auto;padding:18px}
 .topbar{
   display:grid;
@@ -1029,6 +1155,8 @@ button.warn{background:#fff6e8;border-color:#efdab4;color:var(--warn)}
 h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
 .sub{color:var(--muted);margin-top:4px}
 .pills,.toolbar,.row,.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.top-actions{justify-content:flex-end}
+.top-actions button{min-height:32px;padding:5px 10px}
 .pill{
   display:inline-flex;
   min-height:30px;
@@ -1042,7 +1170,7 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
 }
 .layout{
   display:grid;
-  grid-template-columns:360px minmax(0,1fr);
+  grid-template-columns:420px minmax(0,1fr);
   gap:16px;
   margin-top:16px;
 }
@@ -1217,6 +1345,7 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
 @media(max-width:640px){
   .app{padding:12px}
   .topbar{grid-template-columns:1fr}
+  .top-actions{justify-content:flex-start}
   .file-row{grid-template-columns:1fr}
   .file-actions{justify-content:flex-start}
   .stats{grid-template-columns:1fr}
@@ -1230,10 +1359,11 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
       <h1>Cubic DevTools</h1>
       <div class="sub">文件管理 + DevRun 代码运行器。编辑器只写入 <strong>__RUN_APP_ID__</strong>，不会修改已有 app 源码。</div>
     </div>
-    <div class="pills">
+    <div class="pills top-actions">
       <span class="pill" id="badgeVersion">--</span>
       <span class="pill" id="badgeDir">/sd</span>
       <span class="pill" id="badgeRun">DevRun</span>
+      <button id="btnReload" type="button" class="secondary" title="重启 DevTools 服务并读取 SD 卡上的新版 main.lua">应用更新</button>
     </div>
   </section>
 
@@ -1250,8 +1380,13 @@ h1{margin:0;font-size:26px;line-height:1.1;letter-spacing:0}
         <div class="toolbar">
           <button id="btnUp" type="button">上级</button>
           <button id="btnNewFolder" type="button" class="warn">新目录</button>
-          <button id="btnChooseUpload" type="button" class="primary">上传文件</button>
-          <button id="btnChooseFolder" type="button">上传文件夹</button>
+          <details id="uploadPicker" class="upload-picker">
+            <summary id="btnChooseUpload">上传</summary>
+            <div class="upload-options">
+              <button id="btnChooseFiles" type="button">上传文件</button>
+              <button id="btnChooseFolder" type="button">上传文件夹</button>
+            </div>
+          </details>
         </div>
         <div class="row" style="margin-top:10px"><input id="dirPath" class="path-box" value="/sd"></div>
         <div class="row" style="margin-top:8px"><input id="searchInput" class="search-box" placeholder="搜索当前目录"></div>
@@ -1393,6 +1528,12 @@ function parentPath(path){
 }
 function joinPath(dir, name){
   return dir === serverInfo.root_path ? serverInfo.root_path + "/" + name : dir + "/" + name;
+}
+function validateEntryName(name){
+  const value = String(name || "").trim();
+  if(!value) throw new Error("名称不能为空");
+  if(value === "." || value === ".." || /[\\/\0]/.test(value)) throw new Error("名称不能包含路径分隔符或特殊目录名");
+  return value;
 }
 function normalizeRelativePath(path){
   const raw = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
@@ -1544,11 +1685,14 @@ function renderList(items){
     downBtn.className = "primary";
     downBtn.textContent = "下载";
     downBtn.onclick = ev => {ev.stopPropagation(); setSelected(item); downloadSelected().catch(err=>showStatus(err.message,true))};
+    const renameBtn = document.createElement("button");
+    renameBtn.textContent = "重命名";
+    renameBtn.onclick = ev => {ev.stopPropagation(); setSelected(item); renamePath(item).catch(err=>showStatus(err.message,true))};
     const deleteBtn = document.createElement("button");
     deleteBtn.className = "danger";
     deleteBtn.textContent = "删除";
     deleteBtn.onclick = ev => {ev.stopPropagation(); deletePath(item).catch(err=>showStatus(err.message,true))};
-    actions.append(openBtn, downBtn, deleteBtn);
+    actions.append(openBtn, downBtn, renameBtn, deleteBtn);
     row.append(main, actions);
     box.appendChild(row);
   });
@@ -1560,6 +1704,39 @@ async function loadInfo(){
   qs("badgeVersion").textContent = data.version || "--";
   qs("badgeRun").textContent = data.run_app_id || RUN_APP_ID;
   qs("runPath").textContent = data.run_app_main || "/sd/apps/" + RUN_APP_ID + "/main.lua";
+  qs("btnReload").disabled = data.reload_available === false;
+}
+async function reloadDevTools(){
+  if(!window.confirm("重新读取 /sd/apps/devtools/main.lua 并更新当前管理页面？")) return;
+  const button = qs("btnReload");
+  const previousVersion = serverInfo.version || "";
+  const previousGeneration = Number(serverInfo.generation || 0);
+  const previousStartedAt = Number(serverInfo.started_at || 0);
+  button.disabled = true;
+  showStatus("正在应用 DevTools 更新...", false);
+  try{
+    const accepted = await parseJson(await fetch(apiUrl("/api/reload"), {method:"POST"}));
+    const deadline = Date.now() + 12000;
+    await new Promise(resolve => window.setTimeout(resolve, Number(accepted.reload_in_ms || 250) + 150));
+    while(Date.now() < deadline){
+      try{
+        const res = await fetch(apiUrl("/api/info", {_reload:Date.now()}));
+        const info = await parseJson(res);
+        const generationChanged = Number(info.generation || 0) !== previousGeneration;
+        const startedAtChanged = Number(info.started_at || 0) !== previousStartedAt;
+        const versionChanged = String(info.version || "") !== previousVersion;
+        if(generationChanged || startedAtChanged || versionChanged){
+          showStatus("DevTools 已更新，正在载入新页面...", false);
+          window.location.reload();
+          return;
+        }
+      }catch(_){}
+      await new Promise(resolve => window.setTimeout(resolve, 350));
+    }
+    throw new Error("等待 DevTools 更新超时；若服务无法访问，请重启设备恢复");
+  }finally{
+    button.disabled = false;
+  }
 }
 async function loadDir(path){
   const target = path || currentDir || serverInfo.root_path;
@@ -1755,8 +1932,10 @@ async function downloadSelected(){
   showStatus("已开始流式下载 " + (selectedItem.name || ""), false);
 }
 async function renamePath(item){
-  const nextName = (prompt("输入新名称", item.name || "") || "").trim();
-  if(!nextName || nextName === item.name) return;
+  const entered = prompt("输入新名称", item.name || "");
+  if(entered === null) return;
+  const nextName = validateEntryName(entered);
+  if(nextName === item.name) return;
   const newPath = joinPath(parentPath(item.path), nextName);
   await parseJson(await fetch(apiUrl("/api/rename", {path:item.path, new_path:newPath}), {method:"POST"}));
   if(selectedItem && selectedItem.path === item.path) setSelected(null);
@@ -1773,8 +1952,9 @@ async function deletePath(item){
   showStatus("已删除 " + item.name, false);
 }
 async function createFolder(){
-  const name = (prompt("输入新目录名", "") || "").trim();
-  if(!name) return;
+  const entered = prompt("输入新目录名", "");
+  if(entered === null) return;
+  const name = validateEntryName(entered);
   await parseJson(await fetch(apiUrl("/api/mkdir", {path:joinPath(currentDir, name)}), {method:"POST"}));
   await loadDir(currentDir);
   showStatus("已创建目录 " + name, false);
@@ -1996,12 +2176,14 @@ async function saveRunCode(run){
   return data;
 }
 qs("btnRefresh").onclick = () => loadDir(qs("dirPath").value.trim() || serverInfo.root_path).catch(err=>showStatus(err.message,true));
+qs("btnReload").onclick = () => reloadDevTools().catch(err=>showStatus(err.message,true));
 qs("btnUp").onclick = () => loadDir(parentPath(currentDir)).catch(err=>showStatus(err.message,true));
 qs("btnNewFolder").onclick = () => createFolder().catch(err=>showStatus(err.message,true));
-qs("btnChooseUpload").onclick = () => qs("fileInput").click();
+qs("btnChooseFiles").onclick = () => {qs("uploadPicker").removeAttribute("open"); qs("fileInput").click()};
 qs("fileInput").onchange = () => {uploadFiles(qs("fileInput").files).catch(err=>showStatus(err.message,true)); qs("fileInput").value = ""};
-qs("btnChooseFolder").onclick = () => qs("folderInput").click();
+qs("btnChooseFolder").onclick = () => {qs("uploadPicker").removeAttribute("open"); qs("folderInput").click()};
 qs("folderInput").onchange = () => {uploadFiles(qs("folderInput").files).catch(err=>showStatus(err.message,true)); qs("folderInput").value = ""};
+document.addEventListener("click", ev => {const picker = qs("uploadPicker"); if(picker.open && !picker.contains(ev.target)) picker.removeAttribute("open")});
 qs("searchInput").oninput = () => renderList(currentItems);
 qs("sortSelect").onchange = () => renderList(currentItems);
 qs("dirPath").onkeydown = ev => {if(ev.key === "Enter") loadDir(qs("dirPath").value.trim() || serverInfo.root_path).catch(err=>showStatus(err.message,true))};
@@ -2081,6 +2263,12 @@ function APP.stop(reason)
     return
   end
   APP.shutting_down = true
+  if APP.reload_timer then
+    local timer = APP.reload_timer
+    APP.reload_timer = nil
+    pcall(function() timer:stop() end)
+    pcall(function() timer:unregister() end)
+  end
   APP.unregister_all_routes()
   print("[devtools] stop", text_or(reason, ""))
 end
@@ -2111,6 +2299,7 @@ APP.register_route(httpd.GET, APP.API_PREFIX .. "/code/read", APP.api_read_run_c
 
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/mkdir", APP.api_mkdir)
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/rename", APP.api_rename)
+APP.register_route(httpd.POST, APP.API_PREFIX .. "/reload", APP.api_reload)
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/code/save", APP.route_save_code)
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/code/run", APP.route_run_code)
 

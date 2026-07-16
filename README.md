@@ -311,6 +311,7 @@ http://192.168.0.140/devtools/
 | --- | --- |
 | 文件管理 | 浏览 `/sd`、预览小文本/图片、下载、上传、重命名、删除、建目录 |
 | 上传 app | 把本地文件上传到 `/sd/apps/<app-id>/` |
+| 应用更新 | 重新启动 DevTools service，读取 SD 卡上的新版 `main.lua` |
 | DevRun | 在线编辑 `/sd/apps/devrun/main.lua` |
 | Save | 只保存 DevRun 代码 |
 | Run | 保存并 `app.launch("devrun")` |
@@ -331,6 +332,7 @@ DevRun 适合快速试代码；确认后再整理成独立 app 目录和 `app.in
 | `GET` | `/code/read` | 读取 DevRun main.lua |
 | `POST` | `/mkdir?path=/sd/apps/hello` | 创建目录 |
 | `POST` | `/rename?path=...&new_path=...` | 重命名/移动 |
+| `POST` | `/reload` | 返回 `202` 后重新启动 DevTools service 并加载新版 `main.lua` |
 | `POST` | `/code/save` | 保存请求 body 到 DevRun main.lua |
 | `POST` | `/code/run` | 保存请求 body 并启动 DevRun |
 | `PUT` | `/upload?path=...&offset=0&total=123` | 流式上传文件；`offset` 保留给兼容/断点写入 |
@@ -350,6 +352,7 @@ curl -X POST \
 DevTools 上传使用单次 PUT 流式写入，读取 API 仍按块返回，浏览器下载走文件流；
 这些路径都不会把完整文件一次性读入 Lua 内存。
 单文件最大 64MB。
+首次从不含 `/reload` 的旧版升级时仍需重启设备一次；此后可使用页面顶部的“应用更新”。
 
 上传完整 app 时，推荐先在 DevTools 网页里创建 `/sd/apps/hello`，再上传
 `app.info`、`main.lua`、`main.png` 等文件，最后重扫 app 列表。
