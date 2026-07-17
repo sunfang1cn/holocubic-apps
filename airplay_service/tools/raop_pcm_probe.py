@@ -163,6 +163,22 @@ class TimingResponder:
                 continue
             except OSError:
                 return
+            if len(packet) < 32 or packet[1] not in (0xD2, 0x52):
+                continue
+            stamp = ntp_timestamp()
+            response = (
+                bytes((0x80, 0xD3))
+                + packet[2:4]
+                + bytes(4)
+                + packet[24:32]
+                + stamp
+                + stamp
+            )
+            try:
+                self.udp.sendto(response, peer)
+                self.requests += 1
+            except OSError:
+                return
 
 
 class ResendResponder:
@@ -561,6 +577,17 @@ def run(args: argparse.Namespace) -> None:
             print(f"pipelined OPTIONS x{args.pipeline_options}")
             rtsp.pipeline_options(args.pipeline_options)
         if args.handshake_only:
+            for index in range(args.metadata_updates):
+                rtsp.request(
+                    "SET_PARAMETER",
+                    uri,
+                    headers={"Content-Type": "application/x-dmap-tagged"},
+                    body=metadata(
+                        f"{args.title} {index + 1}", args.artist, args.album
+                    ),
+                )
+                if args.metadata_interval > 0:
+                    time.sleep(args.metadata_interval)
             time.sleep(args.hold_after_record)
             print(f"timing requests handled: {timing_responder.requests}")
             if args.require_timing and timing_responder.requests == 0:
@@ -628,6 +655,18 @@ def main() -> None:
     parser.add_argument("--hold-after-record", type=float, default=0.2)
     parser.add_argument("--require-timing", action="store_true")
     parser.add_argument("--pipeline-options", type=int, default=0)
+    parser.add_argument(
+        "--metadata-updates",
+        type=int,
+        default=0,
+        help="send repeated DMAP title updates after RECORD",
+    )
+    parser.add_argument(
+        "--metadata-interval",
+        type=float,
+        default=0.05,
+        help="seconds between repeated metadata updates",
+    )
     parser.add_argument("--title", default="RAOP PCM Probe")
     parser.add_argument("--artist", default="HoloCubic")
     parser.add_argument("--album", default="AirPlay Service Test")
@@ -636,6 +675,8 @@ def main() -> None:
         parser.error("--amplitude must be between 0 and 1")
     if args.pipeline_options < 0:
         parser.error("--pipeline-options must be non-negative")
+    if args.metadata_updates < 0 or args.metadata_interval < 0:
+        parser.error("metadata update controls must be non-negative")
     if args.duration <= 0:
         parser.error("--duration must be positive")
     if args.drop_every < 0 or args.drop_burst_every < 0 or args.drop_burst_packets < 0:

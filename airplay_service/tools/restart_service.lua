@@ -5,11 +5,11 @@
 pcall(function() app.stop_service("airplay_service") end)
 
 local start_timer = tmr.create()
-start_timer:alarm(1000, tmr.ALARM_SINGLE, function()
+start_timer:alarm(2500, tmr.ALARM_SINGLE, function()
   pcall(function() app.start_service("airplay_service") end)
 end)
 
 local exit_timer = tmr.create()
-exit_timer:alarm(2500, tmr.ALARM_SINGLE, function()
+exit_timer:alarm(5000, tmr.ALARM_SINGLE, function()
   if app and app.exit then pcall(app.exit) end
 end)

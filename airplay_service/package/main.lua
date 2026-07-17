@@ -1,9 +1,10 @@
 -- HoloCubic AirPlay 1 / RAOP background service.
 -- Author: sunfang1cn@gmail.com
 --
--- The Lua layer owns discovery, RTSP, metadata and UDP socket callbacks.  It
--- can play an unencrypted L16 stream without a native module.  The bundled
--- airplay_core.so adds Apple-Challenge, RSA/AES, ALAC and a PSRAM jitter task.
+-- The Lua layer owns discovery, RTSP and metadata.  On SDK3 firmware the
+-- bundled core owns realtime RTP/control/timing UDP in a native worker; older
+-- hosts retain the Lua UDP fallback.  The core also supplies RSA/AES/ALAC,
+-- mono speaker output and PSRAM jitter buffering.
 
 local previous = rawget(_G, "AIRPLAY_SERVICE")
 if previous and previous.stop then
@@ -13,16 +14,21 @@ end
 local configured = rawget(_G, "AIRPLAY_SERVICE_CONFIG")
 
 AIRPLAY_SERVICE = {
-  VERSION = "0.3.15",
+  VERSION = "0.3.24",
   APP_DIR = "/sd/apps/airplay_service",
   MODULE_PATH = "/sd/apps/airplay_service/modules/airplay_core.so",
   STATUS_PATH = "/sd/apps/airplay_service/status.json",
+  WEBUI_CONFIG_PATH = "/sd/apps/airplay_service/webui_config.lua",
+  WEBUI_PAGE_PATH = "/sd/apps/airplay_service/webui.html",
+  WEBUI_ROUTE_BASE = "/airplay_service",
   running = true,
   timers = {},
   clients = {},
   subscribers = {},
   core = nil,
   core_error = nil,
+  native_udp_available = false,
+  native_udp = false,
   output_owned = false,
   network_ip = nil,
   system_ip = nil,
@@ -30,6 +36,10 @@ AIRPLAY_SERVICE = {
   ip_lookup_ms = 0,
   ip_lookup_error = nil,
   audio_focus_handler = nil,
+  overlay = nil,
+  overlay_dirty = false,
+  overlay_last_run_ms = nil,
+  webui_routes = {},
 }
 
 local APP = AIRPLAY_SERVICE
@@ -41,10 +51,12 @@ local defaults = {
   audio_port = 6000,
   control_port = 6001,
   timing_port = 6002,
+  native_udp_enabled = true,
   i2s_port = 0,
   data_out_pin = 48,
   sample_rate = 44100,
   channels = 2,
+  output_channels = 1,
   bits = 16,
   dma_buffer_count = 12,
   dma_buffer_len = 512,
@@ -57,10 +69,20 @@ local defaults = {
   mdns_interval_ms = 30000,
   network_poll_ms = 2000,
   drain_interval_ms = 10,
+  overlay_refresh_ms = 100,
+  -- Separates display redraws from frequent RTSP metadata updates.  This is
+  -- deliberately not exposed as a normal WebUI control: 1 s keeps foreground
+  -- apps responsive while title state still updates immediately.
+  overlay_min_render_interval_ms = 1000,
+  overlay_enabled = true,
+  overlay_position = "top",
+  overlay_background = "transparent",
+  overlay_font_size = 16,
   timing_poll_ms = 100,
   timing_initial_interval_ms = 300,
   timing_interval_ms = 3000,
   debug = false,
+  lyrics_dir = nil,
   ip = nil,
 }
 
@@ -73,6 +95,8 @@ end
 APP.config = merge({}, defaults)
 local ok_file, file_config = pcall(dofile, APP.APP_DIR .. "/config.lua")
 if ok_file and type(file_config) == "table" then merge(APP.config, file_config) end
+local ok_webui_file, webui_config = pcall(dofile, APP.WEBUI_CONFIG_PATH)
+if ok_webui_file and type(webui_config) == "table" then merge(APP.config, webui_config) end
 merge(APP.config, configured)
 
 APP.state = {
@@ -99,6 +123,7 @@ APP.state = {
   error = nil,
   warning = nil,
   native_core = false,
+  native_udp = false,
   auth_available = false,
   alac_available = false,
   encryption_available = false,
@@ -111,6 +136,13 @@ APP.state = {
   last_rtsp_response_sent_ms = nil,
   last_rtsp_send_error = nil,
   last_disconnect_pending_responses = 0,
+  last_disconnect_pending_methods = "",
+  last_rtsp_response_latency_ms = 0,
+  max_rtsp_response_latency_ms = 0,
+  last_overlay_update_ms = nil,
+  last_overlay_render_ms = 0,
+  max_overlay_render_ms = 0,
+  overlay_error = nil,
   last_session_end = nil,
   last_session_end_ms = nil,
   last_timing_response_ms = nil,
@@ -123,6 +155,11 @@ APP.state = {
     rtsp_responses_queued = 0,
     rtsp_responses_sent = 0,
     rtsp_send_errors = 0,
+    rtsp_response_over_250ms = 0,
+    rtsp_response_over_1000ms = 0,
+    overlay_updates = 0,
+    overlay_updates_coalesced = 0,
+    overlay_errors = 0,
     rtp_received = 0,
     rtp_written = 0,
     rtp_lost = 0,
@@ -158,6 +195,10 @@ local function snapshot()
 end
 
 local function notify()
+  if APP.overlay_dirty then
+    S.metrics.overlay_updates_coalesced = S.metrics.overlay_updates_coalesced + 1
+  end
+  APP.overlay_dirty = true
   if #APP.subscribers == 0 then return end
   local value = snapshot()
   for i = #APP.subscribers, 1, -1 do
@@ -165,6 +206,119 @@ local function notify()
     local ok = pcall(fn, value)
     if not ok then table.remove(APP.subscribers, i) end
   end
+end
+
+local WEBUI_CONFIG_KEYS = {
+  "overlay_enabled",
+  "overlay_position",
+  "overlay_background",
+  "overlay_font_size",
+}
+
+local function webui_config_document()
+  return {
+    overlay_enabled = APP.config.overlay_enabled ~= false,
+    overlay_position = APP.config.overlay_position == "bottom" and "bottom" or "top",
+    overlay_background = APP.config.overlay_background == "gray" and "gray" or "transparent",
+    overlay_font_size = tonumber(APP.config.overlay_font_size) or 16,
+  }
+end
+
+local function url_decode(value)
+  value = tostring(value or ""):gsub("+", " ")
+  return value:gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+end
+
+local function parse_query(query)
+  local values = {}
+  for pair in tostring(query or ""):gmatch("[^&]+") do
+    local key, value = pair:match("^([^=]*)=(.*)$")
+    if not key then key, value = pair, "" end
+    values[url_decode(key)] = url_decode(value)
+  end
+  return values
+end
+
+local function json_response(status, value)
+  local codec = rawget(_G, "json") or rawget(_G, "sjson")
+  local ok, body = pcall(function() return codec.encode(value) end)
+  if not ok or type(body) ~= "string" then
+    status, body = "500 Internal Server Error", "{\"ok\":false,\"error\":\"json encode failed\"}"
+  end
+  return {
+    status = status or "200 OK",
+    type = "application/json; charset=utf-8",
+    headers = { ["cache-control"] = "no-store", ["connection"] = "close" },
+    body = body,
+  }
+end
+
+local function text_response(status, content_type, body, headers)
+  headers = headers or {}
+  headers["cache-control"] = headers["cache-control"] or "no-store"
+  headers["connection"] = headers["connection"] or "close"
+  return { status = status or "200 OK", type = content_type, headers = headers, body = body or "" }
+end
+
+local function persist_webui_config()
+  if not file or not file.putcontents then return nil, "file.putcontents unavailable" end
+  local config = webui_config_document()
+  local rows = {
+    "-- Persistent WebUI preferences for AirPlay Service.",
+    "-- This file is maintained by /airplay_service/ and intentionally does not replace config.lua.",
+    "return {",
+  }
+  for _, key in ipairs(WEBUI_CONFIG_KEYS) do
+    local value = config[key]
+    if type(value) == "string" then
+      rows[#rows + 1] = "  " .. key .. " = " .. string.format("%q", value) .. ","
+    else
+      rows[#rows + 1] = "  " .. key .. " = " .. tostring(value) .. ","
+    end
+  end
+  rows[#rows + 1] = "}"
+  local ok, result = pcall(file.putcontents, APP.WEBUI_CONFIG_PATH, table.concat(rows, "\n") .. "\n")
+  if not ok or not result then return nil, tostring(result or "write failed") end
+  return true
+end
+
+function APP.apply_webui_config(values, save)
+  values = values or {}
+  local changed = false
+  local enabled = values.overlay_enabled
+  if enabled ~= nil then
+    local next_enabled = tostring(enabled) == "1" or tostring(enabled):lower() == "true" or tostring(enabled):lower() == "on"
+    if APP.config.overlay_enabled ~= next_enabled then APP.config.overlay_enabled, changed = next_enabled, true end
+  end
+  if values.overlay_position ~= nil then
+    local position = tostring(values.overlay_position) == "bottom" and "bottom" or "top"
+    if APP.config.overlay_position ~= position then APP.config.overlay_position, changed = position, true end
+  end
+  if values.overlay_background ~= nil then
+    local background = tostring(values.overlay_background) == "gray" and "gray" or "transparent"
+    if APP.config.overlay_background ~= background then APP.config.overlay_background, changed = background, true end
+  end
+  if values.overlay_font_size ~= nil then
+    local size = tonumber(values.overlay_font_size) or APP.config.overlay_font_size
+    size = size >= 18 and 18 or (size <= 14 and 14 or 16)
+    if APP.config.overlay_font_size ~= size then APP.config.overlay_font_size, changed = size, true end
+  end
+  if changed and APP.overlay and APP.overlay.configure then
+    local ok, err = pcall(APP.overlay.configure, APP.overlay, APP.config)
+    if not ok then S.overlay_error = tostring(err) end
+  end
+  if changed then
+    APP.overlay_last_run_ms = nil
+    APP.overlay_dirty = true
+    notify()
+  end
+  if save then
+    local ok, err = persist_webui_config()
+    if not ok then return nil, err end
+  end
+  return webui_config_document(), changed
 end
 
 local function write_status(reason)
@@ -203,9 +357,14 @@ local function runtime_document()
   document.system_ip = APP.system_ip
   document.core_error = APP.core_error
   document.rtsp_port = APP.config.rtsp_port
+  document.overlay_config = webui_config_document()
   if APP.core and APP.core.state then
     local ok, audio = pcall(APP.core.state)
     if ok and type(audio) == "table" then document.audio = audio end
+  end
+  if APP.overlay and APP.overlay.get_state then
+    local ok, overlay = pcall(APP.overlay.get_state, APP.overlay)
+    if ok and type(overlay) == "table" then document.overlay = overlay end
   end
   return document
 end
@@ -217,7 +376,9 @@ local function register_status_route()
   local ok, err = pcall(function()
     return httpd.dynamic(httpd.GET, route, function()
       local codec = rawget(_G, "json") or rawget(_G, "sjson")
-      local encoded = codec.encode(runtime_document())
+      local document = runtime_document()
+      document.ok = true
+      local encoded = codec.encode(document)
       return {
         status = "200 OK",
         type = "application/json; charset=utf-8",
@@ -230,6 +391,68 @@ local function register_status_route()
     APP.status_route = route
   else
     S.warning = "status route unavailable: " .. tostring(err)
+  end
+end
+
+local function unregister_webui_routes()
+  if not httpd or not httpd.unregister then return end
+  for i = #APP.webui_routes, 1, -1 do
+    local item = APP.webui_routes[i]
+    pcall(function() httpd.unregister(item.method, item.route) end)
+    table.remove(APP.webui_routes, i)
+  end
+end
+
+local function register_webui_route(method, route, handler)
+  pcall(function() httpd.unregister(method, route) end)
+  local ok, err = pcall(function() return httpd.dynamic(method, route, handler) end)
+  if not ok or err then return nil, tostring(err or "httpd.dynamic failed") end
+  APP.webui_routes[#APP.webui_routes + 1] = { method = method, route = route }
+  return true
+end
+
+local function register_webui_routes()
+  if not httpd or not httpd.dynamic or not httpd.GET or not httpd.POST then
+    S.warning = "WebUI unavailable: httpd dynamic routes missing"
+    return
+  end
+  unregister_webui_routes()
+  local base = APP.WEBUI_ROUTE_BASE
+  local function redirect()
+    return text_response("302 Found", "text/plain; charset=utf-8", "", { ["location"] = base .. "/" })
+  end
+  local function index()
+    local page
+    if file and file.getcontents then
+      local ok, body = pcall(file.getcontents, APP.WEBUI_PAGE_PATH)
+      if ok and type(body) == "string" then page = body end
+    end
+    if not page then
+      return text_response("503 Service Unavailable", "text/plain; charset=utf-8", "AirPlay WebUI page not installed")
+    end
+    return text_response("200 OK", "text/html; charset=utf-8", page)
+  end
+  local function config_get()
+    return json_response("200 OK", { ok = true, config = webui_config_document(), status = runtime_document() })
+  end
+  local function config_post(req)
+    local values = parse_query(req and req.query)
+    local config, changed_or_error = APP.apply_webui_config(values, true)
+    if not config then return json_response("500 Internal Server Error", { ok = false, error = changed_or_error }) end
+    return json_response("200 OK", {
+      ok = true, saved = true, changed = changed_or_error == true,
+      config = config, status = runtime_document(),
+    })
+  end
+  local routes = {
+    { httpd.GET, base, redirect },
+    { httpd.GET, base .. "/", index },
+    { httpd.GET, base .. "/config", config_get },
+    { httpd.POST, base .. "/config", config_post },
+  }
+  for _, item in ipairs(routes) do
+    local ok, err = register_webui_route(item[1], item[2], item[3])
+    if not ok then S.warning = "WebUI route unavailable: " .. err end
   end
 end
 
@@ -308,6 +531,35 @@ local function add_timer(ms, mode, fn)
   timer:alarm(ms, mode, fn)
   APP.timers[#APP.timers + 1] = timer
   return timer
+end
+
+local function refresh_overlay()
+  if not APP.running or not APP.overlay_dirty then return end
+  local started = now_ms()
+  -- The WebUI refresh option controls how quickly changes are noticed.  The
+  -- actual transparent-canvas redraw is separately bounded because a CJK
+  -- redraw can take hundreds of milliseconds on firmware 1.200.
+  local interval = math.max(
+    tonumber(APP.config.overlay_refresh_ms) or 100,
+    tonumber(APP.config.overlay_min_render_interval_ms) or 1000
+  )
+  if APP.overlay_last_run_ms and elapsed_ms(started, APP.overlay_last_run_ms) < interval then return end
+  APP.overlay_dirty = false
+  if not APP.overlay or not APP.overlay.update then return end
+  local ok, err = pcall(APP.overlay.update, APP.overlay, S)
+  local finished = now_ms()
+  APP.overlay_last_run_ms = finished
+  local render_ms = math.max(0, elapsed_ms(finished, started))
+  S.last_overlay_update_ms = finished
+  S.last_overlay_render_ms = render_ms
+  S.max_overlay_render_ms = math.max(S.max_overlay_render_ms or 0, render_ms)
+  S.metrics.overlay_updates = S.metrics.overlay_updates + 1
+  if not ok then
+    S.overlay_error = tostring(err)
+    S.metrics.overlay_errors = S.metrics.overlay_errors + 1
+  else
+    S.overlay_error = nil
+  end
 end
 
 local function clean_name(value)
@@ -546,6 +798,13 @@ local function reset_metrics()
   S.last_rtsp_response_sent_ms = nil
   S.last_rtsp_send_error = nil
   S.last_disconnect_pending_responses = 0
+  S.last_disconnect_pending_methods = ""
+  S.last_rtsp_response_latency_ms = 0
+  S.max_rtsp_response_latency_ms = 0
+  S.last_overlay_update_ms = nil
+  S.last_overlay_render_ms = 0
+  S.max_overlay_render_ms = 0
+  S.overlay_error = nil
   S.last_timing_response_ms = nil
   S.last_timing_roundtrip_ms = nil
   S.last_sync_ms = nil
@@ -622,6 +881,7 @@ local function clear_jitter()
 end
 
 local function send_resend(seq, count)
+  if APP.native_udp then return true end
   local session = APP.session
   if not APP.control_socket or not session or not session.client_ip or
      not session.client_control_port then return false end
@@ -724,6 +984,7 @@ local function start_output()
       data_out_pin = APP.config.data_out_pin,
       sample_rate = session.sample_rate or APP.config.sample_rate,
       channels = session.channels or APP.config.channels,
+      output_channels = APP.config.output_channels,
       bits = 16,
       buffer_count = APP.config.dma_buffer_count,
       buffer_len = APP.config.dma_buffer_len,
@@ -847,6 +1108,9 @@ end
 
 local function reset_session(reason)
   stop_output()
+  if APP.native_udp and APP.core and APP.core.network_clear_peer then
+    pcall(APP.core.network_clear_peer)
+  end
   if reason ~= "network stopped" then
     S.last_session_end = reason
     S.last_session_end_ms = now_ms()
@@ -869,6 +1133,8 @@ local function native_capabilities()
   S.auth_available = caps and caps.apple_challenge == true or APP.core.apple_response ~= nil
   S.encryption_available = caps and caps.aes == true or false
   S.alac_available = caps and caps.alac == true or false
+  APP.native_udp_available = caps and caps.native_socket_abi == true and
+                             APP.core.network_start ~= nil
 end
 
 local function load_native_core()
@@ -915,11 +1181,21 @@ local reason_phrases = {
 local function finish_response(ctx, item)
   ctx.sending_response = false
   ctx.current_response = nil
+  local sent_ms = now_ms()
+  local latency_ms = item.queued_ms and math.max(0, elapsed_ms(sent_ms, item.queued_ms)) or 0
   S.metrics.rtsp_responses_sent = S.metrics.rtsp_responses_sent + 1
+  if latency_ms > 250 then
+    S.metrics.rtsp_response_over_250ms = S.metrics.rtsp_response_over_250ms + 1
+  end
+  if latency_ms > 1000 then
+    S.metrics.rtsp_response_over_1000ms = S.metrics.rtsp_response_over_1000ms + 1
+  end
   S.last_rtsp_response_method = item.method
   S.last_rtsp_response_code = item.code
-  S.last_rtsp_response_sent_ms = now_ms()
-  if item.after_send then pcall(item.after_send) end
+  S.last_rtsp_response_sent_ms = sent_ms
+  S.last_rtsp_response_latency_ms = latency_ms
+  S.max_rtsp_response_latency_ms = math.max(S.max_rtsp_response_latency_ms or 0, latency_ms)
+  return item.after_send
 end
 
 local function pump_response(ctx)
@@ -968,6 +1244,7 @@ local function send_response(ctx, request, code, headers, body, after_send)
     after_send = after_send,
     method = request.method or "UNKNOWN",
     code = code,
+    queued_ms = now_ms(),
   }
   S.metrics.rtsp_responses_queued = S.metrics.rtsp_responses_queued + 1
   S.last_rtsp_response_queued_ms = now_ms()
@@ -1095,6 +1372,17 @@ local function handle_rtsp(ctx, request)
     APP.session.timing_request_count = 0
     APP.session.last_timing_request_ms = nil
     APP.session.timing_active = false
+    if APP.native_udp and APP.core and APP.core.network_set_peer then
+      local peer_ip = APP.session.client_ip or ctx.peer_ip or S.client_ip
+      local peer_ok, configured, peer_err = pcall(APP.core.network_set_peer, {
+        ip = peer_ip,
+        control_port = APP.session.client_control_port,
+        timing_port = APP.session.client_timing_port,
+      })
+      if not peer_ok or not configured then
+        S.warning = "native UDP peer setup failed: " .. tostring(peer_ok and peer_err or configured)
+      end
+    end
     send_response(ctx, request, 200, {
       ["Transport"] = "RTP/AVP/UDP;unicast;mode=record;server_port=" .. APP.config.audio_port ..
         ";control_port=" .. APP.config.control_port .. ";timing_port=" .. APP.config.timing_port,
@@ -1112,14 +1400,21 @@ local function handle_rtsp(ctx, request)
       return
     end
     APP.session.timing_active = true
+    if APP.native_udp and APP.core and APP.core.network_set_timing then
+      pcall(APP.core.network_set_timing, true)
+    end
     set_phase("buffering")
     send_response(ctx, request, 200, { ["Audio-Latency"] = "11025" })
     return
   end
 
   if method == "SET_PARAMETER" then
-    apply_metadata(request)
-    send_response(ctx, request, 200)
+    -- The sender treats metadata/progress calls as control keepalives.  Finish
+    -- the RTSP response before parsing metadata or touching the overlay so a
+    -- busy foreground UI cannot make iOS time out the control connection.
+    send_response(ctx, request, 200, nil, nil, function()
+      apply_metadata(request)
+    end)
     return
   end
 
@@ -1142,6 +1437,9 @@ local function handle_rtsp(ctx, request)
   end
 
   if method == "PAUSE" then
+    if APP.native_udp and APP.core and APP.core.network_set_timing then
+      pcall(APP.core.network_set_timing, false)
+    end
     stop_output()
     set_phase("paused")
     send_response(ctx, request, 200)
@@ -1232,14 +1530,24 @@ local function on_connection(socket)
   socket:on("sent", function()
     if ctx.closed or not ctx.sending_response or not ctx.current_response then return end
     local item = ctx.current_response
-    finish_response(ctx, item)
+    local after_send = finish_response(ctx, item)
+    -- Start the next queued write before any metadata/subscriber work.  This
+    -- preserves response ordering while keeping pipelined control traffic out
+    -- of application callbacks.
     pump_response(ctx)
+    if after_send then pcall(after_send) end
   end)
   socket:on("receive", function(_, data) on_tcp_receive(ctx, data) end)
   socket:on("disconnection", function()
     ctx.closed = true
     local pending = #(ctx.response_queue or {}) + (ctx.current_response and 1 or 0)
     S.last_disconnect_pending_responses = pending
+    local methods = {}
+    if ctx.current_response then methods[#methods + 1] = ctx.current_response.method end
+    for index = 1, math.min(8, #(ctx.response_queue or {})) do
+      methods[#methods + 1] = ctx.response_queue[index].method
+    end
+    S.last_disconnect_pending_methods = table.concat(methods, ",")
     APP.clients[socket] = nil
     if APP.session and ctx.session_id == S.session_id then reset_session("disconnect") end
   end)
@@ -1299,6 +1607,7 @@ end
 
 local function poll_timing()
   local session = APP.session
+  if APP.native_udp then return end
   if not APP.running or not session or not session.timing_active then return end
   local port = tonumber(session.client_timing_port)
   local ip = session.client_ip or S.client_ip
@@ -1357,8 +1666,13 @@ local function close_network()
   safe_close(APP.audio_socket)
   safe_close(APP.control_socket)
   safe_close(APP.timing_socket)
+  if APP.native_udp and APP.core and APP.core.network_stop then
+    pcall(APP.core.network_stop)
+  end
   APP.rtsp_server, APP.mdns_socket, APP.audio_socket = nil, nil, nil
   APP.control_socket, APP.timing_socket = nil, nil
+  APP.native_udp = false
+  S.native_udp = false
   reset_session("network stopped")
   APP.network_ip = nil
   S.ready = false
@@ -1368,11 +1682,27 @@ local function start_network(ip)
   if not net then set_phase("error", "firmware has no net API") return nil end
   APP.network_ip = ip
   local ok, err = pcall(function()
-    APP.audio_socket = create_udp(APP.config.audio_port, function(_, data, _, source_ip)
-      queue_rtp(data, source_ip)
-    end)
-    APP.control_socket = create_udp(APP.config.control_port, on_control)
-    APP.timing_socket = create_udp(APP.config.timing_port, on_timing)
+    if APP.config.native_udp_enabled ~= false and
+       APP.native_udp_available and APP.core and APP.core.network_start then
+      local started, native_err = APP.core.network_start({
+        audio_port = APP.config.audio_port,
+        control_port = APP.config.control_port,
+        timing_port = APP.config.timing_port,
+      })
+      if started then
+        APP.native_udp = true
+        S.native_udp = true
+      else
+        S.warning = "native UDP unavailable; using Lua fallback: " .. tostring(native_err)
+      end
+    end
+    if not APP.native_udp then
+      APP.audio_socket = create_udp(APP.config.audio_port, function(_, data, _, source_ip)
+        queue_rtp(data, source_ip)
+      end)
+      APP.control_socket = create_udp(APP.config.control_port, on_control)
+      APP.timing_socket = create_udp(APP.config.timing_port, on_timing)
+    end
     APP.mdns_socket = create_mdns_socket()
     APP.rtsp_server = net.createServer(net.TCP, APP.config.rtsp_idle_timeout_s)
     APP.rtsp_server:listen(APP.config.rtsp_port, on_connection)
@@ -1470,18 +1800,31 @@ function APP.stop(reason)
   for _, timer in ipairs(APP.timers) do stop_timer(timer) end
   APP.timers = {}
   APP.subscribers = {}
+  APP.overlay_dirty = false
+  if APP.overlay and APP.overlay.stop then pcall(APP.overlay.stop, APP.overlay) end
+  APP.overlay = nil
   if APP.status_route and httpd and httpd.unregister then
     pcall(function() httpd.unregister(httpd.GET, APP.status_route) end)
     APP.status_route = nil
   end
+  unregister_webui_routes()
   S.ready = false
   set_phase("stopped", reason)
 end
 
 local startup_ok, startup_error = pcall(function()
+  local overlay_ok, overlay_module = pcall(dofile, APP.APP_DIR .. "/service_ui.lua")
+  if overlay_ok and type(overlay_module) == "table" and type(overlay_module.new) == "function" then
+    APP.overlay = overlay_module.new(APP.config)
+    APP.overlay_dirty = true
+  elseif not overlay_ok then
+    log("service overlay unavailable", overlay_module)
+  end
   load_native_core()
   register_status_route()
+  register_webui_routes()
   add_timer(APP.config.drain_interval_ms, tmr.ALARM_AUTO, drain_audio)
+  add_timer(APP.config.overlay_refresh_ms, tmr.ALARM_AUTO, refresh_overlay)
   add_timer(APP.config.timing_poll_ms, tmr.ALARM_AUTO, poll_timing)
   add_timer(APP.config.network_poll_ms, tmr.ALARM_AUTO, poll_network)
   add_timer(APP.config.mdns_interval_ms, tmr.ALARM_AUTO, function() send_mdns(120) end)

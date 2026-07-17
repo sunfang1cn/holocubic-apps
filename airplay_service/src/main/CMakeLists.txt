@@ -3,7 +3,7 @@ idf_component_register(
         "build_stub.c"
     INCLUDE_DIRS
         "."
-        "../../../mp3_player/src/main"
+        "../../../xiaozhi/src"
     REQUIRES
         espressif__esp_audio_codec
 )
@@ -42,7 +42,7 @@ add_custom_command(
 
 set(airplay_include_flags
     "-I${CMAKE_CURRENT_SOURCE_DIR}"
-    "-I${CMAKE_CURRENT_SOURCE_DIR}/../../../mp3_player/src/main"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}/../../../xiaozhi/src"
     "-I${airplay_build_dir}/config"
     "-I${IDF_PATH}/components/esp_common/include"
     "-I${IDF_PATH}/components/esp_hw_support/include"
@@ -62,6 +62,9 @@ endforeach()
 set(airplay_compile_flags
     -c
     -std=gnu17
+    # Keep the production dynamic module at the qualified size-optimised
+    # setting.  The -O2 variant caused a launcher restart while iPhone
+    # negotiated encrypted ALAC, so it must not ship until root-caused.
     -Os
     -Wall
     -Wextra
@@ -99,7 +102,8 @@ foreach(source_file IN ITEMS airplay_core.c airplay_crypto.c)
                 -o "${object_file}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source_file}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/airplay_crypto.h"
-                "${CMAKE_CURRENT_SOURCE_DIR}/../../../mp3_player/src/main/module_abi.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/airplay_socket_abi.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../../../xiaozhi/src/module_abi.h"
         VERBATIM
     )
 endforeach()
