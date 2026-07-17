@@ -1001,6 +1001,55 @@ key.on(function(evt_code, evt_type, ts_ms)
   end
 end)
 
+-- BLE 手柄：方向移动，A/Menu 在结束画面重新开始，Select/Home 返回桌面。
+local PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT = 1, 2, 4, 8
+local PAD_A, PAD_SELECT, PAD_MENU, PAD_HOME = 16, 4096, 8192, 32768
+local controller_buttons = 0
+local controller_timer = nil
+if controller and controller.state and tmr and tmr.create then
+  controller_timer = tmr.create()
+  controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and tonumber(pad.buttons) or 0
+    buttons = buttons or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (PAD_SELECT | PAD_HOME)) ~= 0 then
+      pcall(function() app.exit() end)
+      return
+    end
+    if game_over and (pressed & (PAD_A | PAD_MENU)) ~= 0 then
+      reset_game()
+      return
+    end
+    if anim_active or game_over then return end
+    local dir = (pressed & PAD_LEFT) ~= 0 and "left"
+      or ((pressed & PAD_RIGHT) ~= 0 and "right")
+      or ((pressed & PAD_UP) ~= 0 and "up")
+      or ((pressed & PAD_DOWN) ~= 0 and "down")
+    if not dir then return end
+    local moved, moves = move(dir)
+    if moved then
+      local r, c = spawn_random()
+      pending_spawn = (r and c) and {r = r, c = c} or nil
+      pending_game_over = not has_available_moves()
+      update_score()
+      if not start_slide_anims(moves, millis() or 0) then
+        with_lv_batch(function()
+          render_grid()
+          if pending_spawn then
+            anim_spawn(pending_spawn.r, pending_spawn.c)
+            pending_spawn = nil
+          end
+          if pending_game_over then show_game_over() end
+        end)
+      end
+    elseif not has_available_moves() then
+      show_game_over()
+    end
+  end)
+end
+
 local tick_timer = tmr.create()
 tick_timer:alarm(20, tmr.ALARM_AUTO, function()
   local ts_ms = millis() or 0
@@ -1021,6 +1070,11 @@ tick_timer:alarm(20, tmr.ALARM_AUTO, function()
 end)
 
 function APP.stop(reason)
+  if controller_timer then
+    pcall(function() controller_timer:stop() end)
+    pcall(function() controller_timer:unregister() end)
+    controller_timer = nil
+  end
   if tick_timer then
     pcall(function() tick_timer:stop() end)
     pcall(function() tick_timer:unregister() end)

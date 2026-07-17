@@ -46,6 +46,7 @@ app_obj.web = Web.new(app_obj.backend, {
 })
 app_obj.input = {
   last_key_ms = 0,
+  controller_buttons = 0,
 }
 
 local KEYMOD = rawget(_G, "key")
@@ -86,6 +87,11 @@ function app_obj.stop(reason)
     pcall(function() app_obj.tick_timer:stop() end)
     pcall(function() app_obj.tick_timer:unregister() end)
     app_obj.tick_timer = nil
+  end
+  if app_obj.input_timer then
+    pcall(function() app_obj.input_timer:stop() end)
+    pcall(function() app_obj.input_timer:unregister() end)
+    app_obj.input_timer = nil
   end
 
   if app and app.on then
@@ -164,16 +170,55 @@ local function handle_key(...)
   end
 
   app_obj.input.last_key_ms = t
-  if evt_code == KEY_UP_CODE then
+  if evt_code == KEY_LEFT_CODE then
     app_obj.backend:select_asset_delta(-1)
-  elseif evt_code == KEY_DOWN_CODE then
-    app_obj.backend:select_asset_delta(1)
-  elseif evt_code == KEY_LEFT_CODE then
-    app_obj.backend:select_interval_delta(-1)
   elseif evt_code == KEY_RIGHT_CODE then
+    app_obj.backend:select_asset_delta(1)
+  elseif evt_code == KEY_UP_CODE then
+    app_obj.backend:select_interval_delta(-1)
+  elseif evt_code == KEY_DOWN_CODE then
     app_obj.backend:select_interval_delta(1)
   end
   app_obj.ui:render(true)
+end
+
+local function start_controller_input()
+  if not controller or not controller.state or not tmr or not tmr.create then return end
+  app_obj.input_timer = tmr.create()
+  app_obj.input_timer:alarm(40, tmr.ALARM_AUTO, function()
+    if app_obj.stopping then return end
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and tonumber(pad.buttons) or 0
+    buttons = buttons or 0
+    local pressed = buttons & (~app_obj.input.controller_buttons)
+    app_obj.input.controller_buttons = buttons
+
+    if (pressed & (4096 | 32768)) ~= 0 then
+      pcall(function() app.exit() end)
+      return
+    end
+    if app_obj.ui.settings_open then
+      if (pressed & 1) ~= 0 then app_obj.ui:settings_move(-1)
+      elseif (pressed & 2) ~= 0 then app_obj.ui:settings_move(1)
+      elseif (pressed & 4) ~= 0 then app_obj.ui:settings_adjust(-1)
+      elseif (pressed & 8) ~= 0 then app_obj.ui:settings_adjust(1)
+      elseif (pressed & 16) ~= 0 then app_obj.ui:close_settings()
+      elseif (pressed & 32) ~= 0 then app_obj.ui:close_settings() end
+      return
+    end
+
+    if (pressed & 8192) ~= 0 then
+      app_obj.ui:open_settings()
+    elseif (pressed & 4) ~= 0 then
+      app_obj.backend:select_asset_delta(-1); app_obj.ui:render(true)
+    elseif (pressed & 8) ~= 0 then
+      app_obj.backend:select_asset_delta(1); app_obj.ui:render(true)
+    elseif (pressed & 1) ~= 0 then
+      app_obj.backend:select_interval_delta(-1); app_obj.ui:render(true)
+    elseif (pressed & 2) ~= 0 then
+      app_obj.backend:select_interval_delta(1); app_obj.ui:render(true)
+    end
+  end)
 end
 
 -- 启动周期任务，网络请求由 backend 内部串行调度。
@@ -205,3 +250,4 @@ if app and app.on then
 end
 
 start_tick()
+start_controller_input()

@@ -275,6 +275,7 @@ function state.stop()
   state.generation = state.generation + 1
   stop_timer("retry_timer")
   stop_timer("reload_timer")
+  stop_timer("controller_timer")
   if state.client then state.client:stop() state.client = nil end
   if state.renderer then state.renderer:destroy() state.renderer = nil end
   if state.web then state.web:stop("app_stop") state.web = nil end
@@ -297,6 +298,25 @@ if key and key.on then
       end
     end)
   end
+end
+
+if controller and controller.state and tmr and tmr.create then
+  local last_buttons = 0
+  state.controller_timer = tmr.create()
+  state.controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~last_buttons)
+    last_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      state.stop()
+      if app and app.exit then pcall(function() app.exit() end) end
+    elseif (pressed & 4) ~= 0 then
+      state.turn_page(-1)
+    elseif (pressed & 8) ~= 0 then
+      state.turn_page(1)
+    end
+  end)
 end
 
 _G.__aida_monitor = state

@@ -458,8 +458,8 @@ function render(){const q=$("search").value.trim().toLowerCase();const list=item
 async function load(){const d=await request("/list");items=d.items||[];render();show("已刷新",false)}
 async function removeFile(name){if(!confirm("确认删除 "+name+" ?"))return;await request("/remove",{method:"DELETE"},{name});await load();show("已删除 "+name,false)}
 function qitem(name){const el=document.createElement("div");el.className="q";el.innerHTML=`<div class="qtop"><strong>${esc(name)}</strong><span class="sub">等待</span></div><div class="bar"><div></div></div>`;$("queue").prepend(el);return{bar:el.querySelector(".bar div"),st:el.querySelector(".sub")}}
-function uploadRaw(f,blob,offset,qi){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("PUT",apiUrl(apiBase,"/upload",{name:f.name,total:f.size,offset}));xhr.upload.onprogress=e=>{const loaded=offset+(e.lengthComputable?e.loaded:blob.size);qi.st.textContent=bytes(loaded)+" / "+bytes(f.size);qi.bar.style.width=(f.size?Math.round(loaded*100/f.size):100)+"%"};xhr.onload=()=>{let d={};try{d=xhr.responseText?JSON.parse(xhr.responseText):{}}catch(e){reject(new Error(xhr.responseText||xhr.statusText));return}if(xhr.status<200||xhr.status>=300||d.ok===false){reject(new Error(d.error||xhr.statusText));return}show("API "+apiBase,false);resolve(d)};xhr.onerror=()=>reject(new Error("上传失败"));xhr.send(blob)})}
-async function uploadOne(f){const qi=qitem(f.name);let off=0;while(off<f.size||(f.size===0&&off===0)){const end=Math.min(off+__UPLOAD_CHUNK__,f.size);qi.st.textContent=bytes(off)+" / "+bytes(f.size);const d=await uploadRaw(f,f.slice(off,end),off,qi);off=Number(d.next_offset||end);if(f.size===0)break}qi.bar.style.width="100%";qi.st.textContent="完成"}
+function uploadNative(f,path,qi){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("PUT","/api/system/fs/upload?path="+encodeURIComponent(path));xhr.upload.onprogress=e=>{const loaded=e.lengthComputable?e.loaded:0;qi.st.textContent=bytes(loaded)+" / "+bytes(f.size);qi.bar.style.width=(f.size?Math.round(loaded*100/f.size):100)+"%"};xhr.onload=()=>{let d={};try{d=xhr.responseText?JSON.parse(xhr.responseText):{}}catch(e){reject(new Error(xhr.responseText||xhr.statusText));return}if(xhr.status<200||xhr.status>=300||d.ok===false){reject(new Error(d.error||xhr.statusText));return}resolve(d)};xhr.onerror=()=>reject(new Error("上传失败"));xhr.send(f)})}
+async function uploadOne(f){const qi=qitem(f.name);const prep=await request("/upload-prepare",{method:"POST"},{name:f.name,total:f.size});await uploadNative(f,prep.temp_path,qi);await request("/upload-commit",{method:"POST"},{name:f.name,total:f.size});qi.bar.style.width="100%";qi.st.textContent="完成"}
 async function uploadFiles(fs){const arr=Array.from(fs||[]);for(const f of arr){try{await uploadOne(f)}catch(e){show(e.message,true)}}await load()}
 function normEq(){eq=Object.assign(JSON.parse(JSON.stringify(EQ_DEFAULT)),eq||{});eq.eq=eq.eq||EQ_DEFAULT.eq.slice();return eq}
 function fillMainVolume(){normEq();if(!$("mainVolume"))return;$("mainVolume").value=eq.volume;$("mainVolumeVal").textContent=Number(eq.volume||0).toFixed(2)}
@@ -878,6 +878,49 @@ local function web_upload(req)
   })
 end
 
+local function web_upload_prepare(req)
+  local q = web_parse_query(req and req.query)
+  local path, safe_or_err = web_music_path(q.name or "")
+  if not path then return web_err("400 Bad Request", safe_or_err) end
+  local total = math.floor(tonumber(q.total) or -1)
+  if total < 0 then return web_err("400 Bad Request", "invalid total") end
+  if total > APP.WEB_MAX_FILE_SIZE then return web_err("413 Payload Too Large", "file too large") end
+  local tmp_path, tmp_err = web_upload_temp_path(safe_or_err)
+  if not tmp_path then return web_err("400 Bad Request", tmp_err) end
+  local dir_ok, dir_err = web_ensure_upload_dir()
+  if not dir_ok then return web_err("500 Internal Server Error", dir_err) end
+  if web_target_is_active_track(path, safe_or_err) then
+    return web_err("409 Conflict", "target is active track")
+  end
+  web_prefetch_before_upload()
+  return web_ok({ name = safe_or_err, temp_path = tmp_path, path = path, total = total })
+end
+
+local function web_upload_commit(req)
+  local q = web_parse_query(req and req.query)
+  local path, safe_or_err = web_music_path(q.name or "")
+  if not path then return web_err("400 Bad Request", safe_or_err) end
+  local total = math.floor(tonumber(q.total) or -1)
+  if total < 0 then return web_err("400 Bad Request", "invalid total") end
+  if total > APP.WEB_MAX_FILE_SIZE then return web_err("413 Payload Too Large", "file too large") end
+  local tmp_path, tmp_err = web_upload_temp_path(safe_or_err)
+  if not tmp_path then return web_err("400 Bad Request", tmp_err) end
+  if web_target_is_active_track(path, safe_or_err) then
+    return web_err("409 Conflict", "target is active track")
+  end
+  local finish_ok, finish_err = web_finish_upload(tmp_path, path, total)
+  if not finish_ok then return web_err("500 Internal Server Error", finish_err) end
+  web_refresh_tracks("upload")
+  feature_log("Upload complete:", safe_or_err, log_bytes(total), "native fs")
+  return web_ok({
+    name = safe_or_err,
+    temp_path = tmp_path,
+    path = path,
+    total = total,
+    done = true,
+  })
+end
+
 local function web_eq_table()
   return eq_settings_snapshot()
 end
@@ -1006,8 +1049,11 @@ local function web_api_dispatch(req)
   if endpoint == "list" and method == httpd.GET then
     return web_list(req)
   end
-  if endpoint == "upload" and method == httpd.PUT then
-    return web_upload(req)
+  if endpoint == "upload-prepare" and method == httpd.POST then
+    return web_upload_prepare(req)
+  end
+  if endpoint == "upload-commit" and method == httpd.POST then
+    return web_upload_commit(req)
   end
   if endpoint == "remove" and method == httpd.DELETE then
     return web_remove(req)
@@ -1043,7 +1089,6 @@ local function register_web_routes_for_base(base)
   local api_prefix = base .. "/api"
   register_web_route(httpd.GET, base .. "/", web_index)
   register_web_route(httpd.GET, api_prefix .. "/*", web_api_dispatch)
-  register_web_route(httpd.PUT, api_prefix .. "/*", web_api_dispatch)
   register_web_route(httpd.DELETE, api_prefix .. "/*", web_api_dispatch)
   register_web_route(httpd.POST, api_prefix .. "/*", web_api_dispatch)
 end
@@ -2152,6 +2197,46 @@ local function bind_keys()
   end)
 end
 
+local PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT = 1, 2, 4, 8
+local PAD_A, PAD_SELECT, PAD_MENU, PAD_HOME = 16, 4096, 8192, 32768
+
+local function adjust_volume(delta)
+  APP.eq_settings.volume = clamp((tonumber(APP.eq_settings.volume) or 0.4) + delta, 0, 1.2)
+  apply_audio_effects()
+  schedule_eq_settings_save()
+  render_ui()
+end
+
+local function start_controller_input()
+  if not controller or not controller.state or not tmr or not tmr.create then return end
+  APP.controller_buttons = 0
+  APP.timers.controller = tmr.create()
+  APP.timers.controller:alarm(40, tmr.ALARM_AUTO, function()
+    if not APP.running then return end
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and tonumber(pad.buttons) or 0
+    buttons = buttons or 0
+    local pressed = buttons & (~(APP.controller_buttons or 0))
+    APP.controller_buttons = buttons
+
+    if (pressed & (PAD_SELECT | PAD_HOME)) ~= 0 then
+      exit_app()
+      return
+    end
+    if (pressed & PAD_LEFT) ~= 0 then
+      next_track(-1)
+    elseif (pressed & PAD_RIGHT) ~= 0 then
+      next_track(1)
+    elseif (pressed & PAD_UP) ~= 0 then
+      adjust_volume(0.05)
+    elseif (pressed & PAD_DOWN) ~= 0 then
+      adjust_volume(-0.05)
+    elseif (pressed & (PAD_A | PAD_MENU)) ~= 0 then
+      toggle_play()
+    end
+  end)
+end
+
 local function start_timers()
   if not tmr or not tmr.create then return end
 
@@ -2160,6 +2245,8 @@ local function start_timers()
 
   APP.timers.ui = tmr.create()
   APP.timers.ui:alarm(APP.UI_TICK_MS, tmr.ALARM_AUTO, render_ui)
+
+  start_controller_input()
 end
 
 local function load_ui_module()

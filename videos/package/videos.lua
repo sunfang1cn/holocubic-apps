@@ -239,6 +239,26 @@ tick_timer:alarm(20, tmr.ALARM_AUTO, function()
   -- ptint ("SCRIPT :  tick_20ms \n")
 end)
 
+local controller_timer = nil
+if controller and controller.state and tmr and tmr.create then
+  local controller_buttons = 0
+  controller_timer = tmr.create()
+  controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      APP.shutdown("controller-exit")
+      if app and app.exit then pcall(function() app.exit() end) end
+    elseif (pressed & 4) ~= 0 then
+      confirm_left(millis() or 0)
+    elseif (pressed & 8) ~= 0 then
+      confirm_right(millis() or 0)
+    end
+  end)
+end
+
 function APP.shutdown(reason)
   pcall(function() key.off() end)
 
@@ -246,6 +266,11 @@ function APP.shutdown(reason)
     pcall(function() tick_timer:stop() end)
     pcall(function() tick_timer:unregister() end)
     tick_timer = nil
+  end
+  if controller_timer then
+    pcall(function() controller_timer:stop() end)
+    pcall(function() controller_timer:unregister() end)
+    controller_timer = nil
   end
 
   if rawget(_G, "VIDEOS_APP") == APP then

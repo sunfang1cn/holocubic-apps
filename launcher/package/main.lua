@@ -3,6 +3,8 @@ local SCREEN_W = 320
 local SCREEN_H = 240
 local ICON_SIZE = 84
 local ICON_DRAW_SIZE = 75
+local ICON_CANVAS_SIZE = 128
+local ICON_MAX_SOURCE_SIZE = 512
 local ICON_Y = 85
 local LABEL_GAP = 17
 local LABEL_H = 16
@@ -15,26 +17,14 @@ local OFFSCREEN_RIGHT_X = SCREEN_W + 45
 local ANIM_MS = 360
 
 local SETTINGS_PATH = "/sd/apps/settings.json"
-local DEFAULT_LANGUAGE = "zh-CN"
 local AP_POLICY_START_DELAY_MS = 750
 local AP_IP_WAIT_MS = 5000
 local AP_POLICY_POLL_MS = 250
 local AUTOSTART_BOOT_WINDOW_MS = 5000
 local AUTOSTART_DELAY_MS = 200
+local APP_LIST_POLL_MS = 1000
 local AUTOSTART_MARK_PATH = "/tmp/launcher_autostart_fired"
 local DEFAULT_AUTOSTART_APP_ID = "wifi_guide"
-local DISPLAY_SERVICE_ID = "display_service"
-local DISPLAY_SERVICE_APP_DIR = "/sd/apps/display_service"
-local DISPLAY_SERVICE_BUNDLE_DIR = "/sd/apps/launcher/services/display_service"
-local DISPLAY_SERVICE_BUNDLE_VERSION = "1.0.4"
-
-local function normalize_language(value)
-  local text = tostring(value or ""):gsub("_", "-")
-  if text == "en" or text:match("^en%-") then return "en" end
-  if text == "ja" or text:match("^ja%-") then return "ja" end
-  if text == "zh-TW" or text == "zh-Hant" or text:match("^zh%-Hant") or text:match("^zh%-HK") then return "zh-TW" end
-  return DEFAULT_LANGUAGE
-end
 
 local function read_settings()
   if not file or not file.getcontents then return {} end
@@ -57,65 +47,17 @@ local function setting_bool(value, fallback)
 end
 
 local SETTINGS = read_settings()
-local LANGUAGE = normalize_language(SETTINGS.language or SETTINGS.locale or SETTINGS.lang)
 local AP_PREFERRED_ENABLED = setting_bool(SETTINGS.ap_enabled, true)
 local AUTOSTART_ENABLED = setting_bool(SETTINGS.autostart_enabled, true)
 local AUTOSTART_APP_ID = tostring(SETTINGS.autostart_app_id or DEFAULT_AUTOSTART_APP_ID)
-local UI_TEXT = {
-  ["zh-CN"] = { no_apps = "暂无应用", loading = "正在启动" },
-  en = { no_apps = "NO APPS", loading = "Starting" },
-  ja = { no_apps = "アプリなし", loading = "起動中" },
-  ["zh-TW"] = { no_apps = "暫無應用", loading = "正在啟動" },
-}
-
-local UI_FONT_PATHS = {
-  ["zh-CN"] = "/sd/apps/launcher/font/launcher_ui_zh_cn_16.bin",
-  ja = "/sd/apps/launcher/font/launcher_ui_ja_16.bin",
-  ["zh-TW"] = "/sd/apps/launcher/font/launcher_ui_zh_tw_16.bin",
-}
 
 local root = lv_scr_act()
-lv_obj_clean(lv_scr_act())
-if rawget(_G, "LAUNCHER_UI_FONT_HANDLE") and lv_font_free then
-  pcall(function() lv_font_free(_G.LAUNCHER_UI_FONT_HANDLE) end)
-end
-_G.LAUNCHER_UI_FONT_HANDLE = nil
-
--- 先让轻量启动页完成一次刷新，再加载当前语言的大字库。
-local splash_bg = lv_obj_create(root)
-lv_obj_set_pos(splash_bg, 0, 0)
-lv_obj_set_size(splash_bg, SCREEN_W, SCREEN_H)
-lv_obj_set_style_bg_color(splash_bg, 0x000000, LV_PART_MAIN)
-lv_obj_set_style_bg_opa(splash_bg, 255, LV_PART_MAIN)
-lv_obj_set_style_border_width(splash_bg, 0, LV_PART_MAIN)
-local splash_label = lv_label_create(root)
-lv_label_set_text(splash_label, "Launcher")
-lv_obj_set_style_text_color(splash_label, 0xFFFFFF, LV_PART_MAIN)
-lv_obj_set_style_text_font(splash_label, LV_FONT_MONTSERRAT_16, LV_PART_MAIN)
-lv_obj_center(splash_label)
-if lv_refr_now then
-  pcall(function() lv_refr_now(nil) end)
-elseif lv_timer_handler then
-  pcall(lv_timer_handler)
-elseif lv_task_handler then
-  pcall(lv_task_handler)
-end
-
-local UI_FONT = LV_FONT_MONTSERRAT_16
-local UI_FONT_HANDLE = nil
-local ui_font_path = UI_FONT_PATHS[LANGUAGE]
-if ui_font_path and lv_font_load then
-  local ok, handle = pcall(function() return lv_font_load(ui_font_path) end)
-  if ok and type(handle) == "number" and handle > 0 then
-    UI_FONT = handle
-    UI_FONT_HANDLE = handle
-    _G.LAUNCHER_UI_FONT_HANDLE = handle
-  end
-end
 lv_obj_clean(root)
+local UI_FONT = LV_FONT_MONTSERRAT_16
 
 local STATE = {
   apps = {},
+  icon_sizes = {},
   index = 1,
   reload_timer = nil,
   anim_timer = nil,
@@ -126,10 +68,13 @@ local STATE = {
   repeat_up = 0,
   up_launch_fired = false,
   autostart_fired = false,
+  app_list_signature = "",
+  app_list_timer = nil,
+  controller_timer = nil,
+  controller_buttons = 0,
 }
 
 local UI = {}
-local ICON_META_CACHE = {}
 
 local function text_or(value, fallback)
   if value == nil or value == "" then
@@ -167,72 +112,6 @@ local function sync_ntp_once()
   end
   pcall(function()
     time_mod.initntp(NTP_SERVER)
-  end)
-end
-
-local function version_parts(value)
-  local parts = {}
-  for part in tostring(value or ""):gmatch("(%d+)") do
-    parts[#parts + 1] = tonumber(part) or 0
-    if #parts >= 4 then break end
-  end
-  return parts
-end
-
-local function version_lt(a, b)
-  local av, bv = version_parts(a), version_parts(b)
-  for i = 1, 4 do
-    local ai, bi = av[i] or 0, bv[i] or 0
-    if ai < bi then return true end
-    if ai > bi then return false end
-  end
-  return false
-end
-
-local function read_info_value(path, key)
-  if not file or not file.getcontents then return "" end
-  local ok, raw = pcall(function() return file.getcontents(path) end)
-  if not ok or type(raw) ~= "string" then return "" end
-  local pattern = "\n%s*" .. key .. "%s*=%s*([^\r\n]+)"
-  return text_or(("\n" .. raw):match(pattern), ""):match("^%s*(.-)%s*$") or ""
-end
-
-local function copy_file(src, dst)
-  if not file or not file.getcontents or not file.putcontents then return false end
-  local ok, data = pcall(function() return file.getcontents(src) end)
-  if not ok or type(data) ~= "string" then return false end
-  local wrote, result = pcall(function() return file.putcontents(dst, data) end)
-  return wrote and result ~= false
-end
-
-local function ensure_display_service()
-  if not file or not file.exists then return false end
-  if not file.exists(DISPLAY_SERVICE_BUNDLE_DIR .. "/main.lua") then return false end
-
-  local current_version = read_info_value(DISPLAY_SERVICE_APP_DIR .. "/app.info", "version")
-  if file.exists(DISPLAY_SERVICE_APP_DIR .. "/main.lua")
-      and current_version ~= ""
-      and not version_lt(current_version, DISPLAY_SERVICE_BUNDLE_VERSION) then
-    return false
-  end
-
-  if file.mkdir then pcall(function() file.mkdir(DISPLAY_SERVICE_APP_DIR) end) end
-  local ok_info = copy_file(DISPLAY_SERVICE_BUNDLE_DIR .. "/app.info", DISPLAY_SERVICE_APP_DIR .. "/app.info")
-  local ok_main = copy_file(DISPLAY_SERVICE_BUNDLE_DIR .. "/main.lua", DISPLAY_SERVICE_APP_DIR .. "/main.lua")
-  if ok_info and ok_main then
-    if app and app.rescan then pcall(function() app.rescan() end) end
-    return true
-  end
-  return false
-end
-
-local function start_display_service()
-  if not app or not app.start_service then
-    return
-  end
-  ensure_display_service()
-  pcall(function()
-    app.start_service(DISPLAY_SERVICE_ID)
   end)
 end
 
@@ -283,21 +162,6 @@ local function current_item()
   return STATE.apps[STATE.index]
 end
 
-local function app_icon(item)
-  if not item or not item.icon or item.icon == "" then
-    return nil
-  end
-  return item.icon
-end
-
-local function path_ext(path)
-  local ext = text_or(path, ""):match("(%.[^./\\]+)$")
-  if not ext then
-    return ""
-  end
-  return string.lower(ext)
-end
-
 local function path_exists(path)
   if not path or path == "" or not file or not file.open then
     return false
@@ -311,206 +175,42 @@ local function path_exists(path)
   return true
 end
 
-local function fallback_sd_icon_path(item, preferred_ext)
-  if text_or(item and item.source, "") ~= "sd" then
-    return nil
-  end
-
-  local app_id = text_or(item and item.id, "")
-  if app_id == "" then
-    return nil
-  end
-
-  local png_path = "/sd/apps/" .. app_id .. "/main.png"
-  local bmp_path = "/sd/apps/" .. app_id .. "/main.bmp"
-  local ext = path_ext(preferred_ext)
-
-  if ext == ".bmp" then
-    if path_exists(bmp_path) then
-      return bmp_path
-    end
-    if path_exists(png_path) then
-      return png_path
-    end
-    return nil
-  end
-
-  if path_exists(png_path) then
-    return png_path
-  end
-  if path_exists(bmp_path) then
-    return bmp_path
-  end
-  return nil
-end
-
-local function normalize_icon_fs_path(path)
-  local src = text_or(path, "")
-  if src == "" then
-    return nil
-  end
-  if src:sub(1, 3) == "S:/" then
-    return src:sub(3)
-  end
-  if src:sub(1, 1) == "/" then
-    return src
-  end
-  return nil
-end
-
-local function read_le_u16(data, index)
-  local b1, b2 = string.byte(data, index, index + 1)
-  if not b1 or not b2 then
-    return nil
-  end
-  return b1 + b2 * 256
-end
-
-local function read_le_u32(data, index)
-  local b1, b2, b3, b4 = string.byte(data, index, index + 3)
-  if not b1 or not b2 or not b3 or not b4 then
-    return nil
-  end
-  return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-end
-
 local function read_be_u32(data, index)
   local b1, b2, b3, b4 = string.byte(data, index, index + 3)
-  if not b1 or not b2 or not b3 or not b4 then
-    return nil
-  end
+  if not b1 or not b2 or not b3 or not b4 then return nil end
   return ((b1 * 256 + b2) * 256 + b3) * 256 + b4
-end
-
-local function read_bmp_size(path)
-  local fd = file and file.open and file.open(path, "r")
-  if not fd then
-    return nil
-  end
-
-  local header = fd:read(30)
-  fd:close()
-  if not header or #header < 26 then
-    return nil
-  end
-  if header:sub(1, 2) ~= "BM" then
-    return nil
-  end
-
-  local dib_size = read_le_u32(header, 15)
-  if dib_size == 12 then
-    local w = read_le_u16(header, 19)
-    local h = read_le_u16(header, 21)
-    if w and h and w > 0 and h > 0 then
-      return { w = w, h = h }
-    end
-    return nil
-  end
-
-  local w = read_le_u32(header, 19)
-  local h = read_le_u32(header, 23)
-  if not w or not h or w == 0 or h == 0 then
-    return nil
-  end
-  if h > 2147483647 then
-    h = 4294967296 - h
-  end
-  if h < 0 then
-    h = -h
-  end
-  return { w = w, h = h }
 end
 
 local function read_png_size(path)
   local fd = file and file.open and file.open(path, "r")
-  if not fd then
-    return nil
-  end
-
+  if not fd then return nil end
   local header = fd:read(24)
   fd:close()
-  if not header or #header < 24 then
-    return nil
-  end
-
-  local sig = string.char(137, 80, 78, 71, 13, 10, 26, 10)
-  if header:sub(1, 8) ~= sig then
-    return nil
-  end
-  if header:sub(13, 16) ~= "IHDR" then
-    return nil
-  end
-
-  local w = read_be_u32(header, 17)
-  local h = read_be_u32(header, 21)
-  if not w or not h or w <= 0 or h <= 0 then
+  if not header or #header < 24 then return nil end
+  if header:sub(1, 8) ~= string.char(137, 80, 78, 71, 13, 10, 26, 10) then return nil end
+  if header:sub(13, 16) ~= "IHDR" then return nil end
+  local w, h = read_be_u32(header, 17), read_be_u32(header, 21)
+  if not w or not h or w < 1 or h < 1 or w > ICON_MAX_SOURCE_SIZE or h > ICON_MAX_SOURCE_SIZE then
     return nil
   end
   return { w = w, h = h }
 end
 
-local function read_image_size(path)
-  local ext = path_ext(path)
-  if ext == ".png" then
-    return read_png_size(path) or read_bmp_size(path)
-  end
-  if ext == ".bmp" then
-    return read_bmp_size(path) or read_png_size(path)
-  end
-  return read_png_size(path) or read_bmp_size(path)
-end
-
-local function resolve_icon_probe_path(item, path)
-  local fs_path = normalize_icon_fs_path(path)
-  if fs_path then
-    return fs_path
-  end
-  return fallback_sd_icon_path(item, path_ext(path))
-end
-
-local function icon_meta(item, path)
-  local cache_key = text_or(path, "")
-  if cache_key == "" then
+local function display_icon_path(item)
+  local app_id = text_or(item and item.id, "")
+  if app_id == "" then
     return nil
   end
-
-  local cached = ICON_META_CACHE[cache_key]
-  if cached ~= nil then
-    return cached or nil
-  end
-
-  local meta = read_image_size(resolve_icon_probe_path(item, path))
-  ICON_META_CACHE[cache_key] = meta or false
-  return meta
-end
-
-local function display_icon_path(item)
-  return app_icon(item) or fallback_sd_icon_path(item, ".png")
+  return "S:/apps/" .. app_id .. "/main.png"
 end
 
 local function has_display_icon(item)
-  local path = display_icon_path(item)
-  if not path or path == "" then
-    return false
-  end
-  return icon_meta(item, path) ~= nil
-end
-
-local function fit_zoom(meta, target_size, dim)
-  if not meta or not meta.w or not meta.h or meta.w <= 0 or meta.h <= 0 then
-    return 256
-  end
-
-  local zoom_w = math.floor((target_size * 256) / meta.w)
-  local zoom_h = math.floor((target_size * 256) / meta.h)
-  local zoom = math.min(zoom_w, zoom_h)
-  local max_zoom = dim and 288 or 320
-  if zoom < 32 then
-    zoom = 32
-  elseif zoom > max_zoom then
-    zoom = max_zoom
-  end
-  return zoom
+  local app_id = text_or(item and item.id, "")
+  if app_id == "" then return false end
+  local size = read_png_size("/sd/apps/" .. app_id .. "/main.png")
+  if not size then return false end
+  STATE.icon_sizes[app_id] = size
+  return true
 end
 
 local function stop_timer(timer_ref_name)
@@ -605,7 +305,7 @@ local function start_ap_policy()
   end)
 end
 
-local function schedule_anim_done()
+local function schedule_anim_done(on_done)
   stop_timer("anim_timer")
   STATE.animating = true
 
@@ -618,72 +318,106 @@ local function schedule_anim_done()
     if STATE.anim_timer == self then
       STATE.anim_timer = nil
     end
+    if on_done then
+      on_done()
+    end
     STATE.animating = false
   end)
 end
 
-local function set_icon(box_id, img_id, item, dim)
+local function create_icon_canvas(parent, w, h)
+  local canvas_id = lv_canvas_create(parent, w, h, LV_IMG_CF_TRUE_COLOR)
+  if not canvas_id or canvas_id <= 0 then return nil end
+  lv_obj_clear_flag(canvas_id, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE)
+  safe_set_hidden(canvas_id, true)
+  return canvas_id
+end
+
+local function ensure_slot_canvas(slot, w, h)
+  if slot.canvas and slot.canvas > 0 and slot.canvas_w == w and slot.canvas_h == h then
+    return true
+  end
+  if slot.canvas and slot.canvas > 0 then
+    lv_obj_del(slot.canvas)
+  end
+  slot.canvas = create_icon_canvas(slot.box, w, h)
+  slot.canvas_w, slot.canvas_h = w, h
+  return slot.canvas ~= nil
+end
+
+local function icon_zoom(w, h)
+  local zoom = math.floor(math.min(ICON_DRAW_SIZE * 256 / w, ICON_DRAW_SIZE * 256 / h))
+  if zoom < 32 then return 32 end
+  if zoom > 1024 then return 1024 end
+  return zoom
+end
+
+local function set_icon(slot, item, dim)
   local path = display_icon_path(item)
-  style_icon_box(box_id, dim and true or false)
-  if path and path ~= "" then
+  local app_id = text_or(item and item.id, "")
+  local size = STATE.icon_sizes[app_id]
+  local loaded = false
+  style_icon_box(slot.box, dim)
+  if path and path ~= "" and size and ensure_slot_canvas(slot, size.w, size.h) then
     local ok = pcall(function()
-      local meta = icon_meta(item, path)
-      local zoom = fit_zoom(meta, ICON_DRAW_SIZE, dim)
-      lv_img_set_src(img_id, path)
-      lv_img_set_size_mode(img_id, LV_IMG_SIZE_MODE_REAL)
-      lv_obj_set_size(img_id, LV_SIZE_CONTENT, LV_SIZE_CONTENT)
-      lv_img_set_zoom(img_id, zoom)
+      lv_canvas_frame_begin(slot.canvas)
+      lv_canvas_fill_bg(slot.canvas, 0x000000, 255)
+      lv_canvas_draw_img(slot.canvas, 0, 0, path, 255)
+      lv_canvas_frame_end(slot.canvas)
+      lv_img_set_pivot(slot.canvas, math.floor(size.w / 2), math.floor(size.h / 2))
+      lv_img_set_zoom(slot.canvas, icon_zoom(size.w, size.h))
     end)
-    safe_set_hidden(img_id, not ok)
-  else
-    safe_set_hidden(img_id, true)
+    safe_set_hidden(slot.canvas, not ok)
+    loaded = ok
+  elseif slot.canvas then
+    safe_set_hidden(slot.canvas, true)
   end
-  lv_obj_set_style_img_opa(img_id, dim and 128 or 255, LV_PART_MAIN)
-  lv_obj_center(img_id)
-end
-
-local function set_triplet_content(left_item, center_item, right_item)
-  safe_set_text(UI.left_label, left_item and text_or(left_item.name, left_item.id) or "")
-  safe_set_text(UI.center_label, center_item and text_or(center_item.name, center_item.id) or "")
-  safe_set_text(UI.right_label, right_item and text_or(right_item.name, right_item.id) or "")
-
-  set_icon(UI.left_icon, UI.left_img, left_item, true)
-  set_icon(UI.center_icon, UI.center_img, center_item, false)
-  set_icon(UI.right_icon, UI.right_img, right_item, true)
-end
-
-local function set_static_positions()
-  lv_obj_set_pos(UI.left_icon, LEFT_X, ICON_Y)
-  lv_obj_set_pos(UI.left_label, LEFT_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_obj_set_pos(UI.center_icon, CENTER_X, ICON_Y)
-  lv_obj_set_pos(UI.center_label, CENTER_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_obj_set_pos(UI.right_icon, RIGHT_X, ICON_Y)
-  lv_obj_set_pos(UI.right_label, RIGHT_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-end
-
-local function start_slide(dir)
-  local left_start_x = 0
-  local center_start_x = 0
-  local right_start_x = 0
-
-  if dir < 0 then
-    left_start_x = OFFSCREEN_LEFT_X
-    center_start_x = LEFT_X
-    right_start_x = CENTER_X
-  else
-    left_start_x = CENTER_X
-    center_start_x = RIGHT_X
-    right_start_x = OFFSCREEN_RIGHT_X
+  if slot.canvas then
+    lv_obj_set_style_img_opa(slot.canvas, dim and 128 or 255, LV_PART_MAIN)
+    lv_obj_center(slot.canvas)
   end
+  return loaded
+end
 
-  lv_obj_set_pos(UI.left_icon, left_start_x, ICON_Y)
-  lv_obj_set_pos(UI.left_label, left_start_x, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_obj_set_pos(UI.center_icon, center_start_x, ICON_Y)
-  lv_obj_set_pos(UI.center_label, center_start_x, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_obj_set_pos(UI.right_icon, right_start_x, ICON_Y)
-  lv_obj_set_pos(UI.right_label, right_start_x, ICON_Y + ICON_SIZE + LABEL_GAP)
+local function item_at(index)
+  local count = #STATE.apps
+  if count <= 0 then return nil end
+  while index < 1 do index = index + count end
+  while index > count do index = index - count end
+  return STATE.apps[index]
+end
 
-  local function anim_x(obj, from_x, to_x)
+local function set_slot_content(slot, item, dim)
+  local next_id = text_or(item and item.id, "")
+  local reuse_pixels = next_id ~= "" and slot.item_id == next_id
+  safe_set_text(slot.label, item and text_or(item.name, item.id) or "")
+  style_text(slot.label, dim and 0x808080 or 0xFFFFFF, UI_FONT, LV_TEXT_ALIGN_CENTER)
+  if reuse_pixels then
+    style_icon_box(slot.box, dim)
+    if slot.canvas then
+      lv_obj_set_style_img_opa(slot.canvas, dim and 128 or 255, LV_PART_MAIN)
+    end
+  else
+    slot.item_id = set_icon(slot, item, dim) and next_id or ""
+  end
+end
+
+local function set_slot_pos(slot, x)
+  lv_obj_set_pos(slot.box, x, ICON_Y)
+  lv_obj_set_pos(slot.label, x, ICON_Y + ICON_SIZE + LABEL_GAP)
+end
+
+local function style_slot(slot, dim)
+  style_icon_box(slot.box, dim)
+  style_text(slot.label, dim and 0x808080 or 0xFFFFFF, UI_FONT, LV_TEXT_ALIGN_CENTER)
+  if slot.canvas then
+    lv_obj_set_style_img_opa(slot.canvas, dim and 128 or 255, LV_PART_MAIN)
+  end
+end
+
+local function anim_slot(slot, from_x, to_x)
+  set_slot_pos(slot, from_x)
+  local function anim_x(obj)
     local a = lv_anim_t()
     lv_anim_init(a)
     lv_anim_set_var(a, obj)
@@ -693,51 +427,93 @@ local function start_slide(dir)
     lv_anim_set_path_cb(a, lv_anim_path_ease_out)
     lv_anim_start(a)
   end
-
-  anim_x(UI.left_icon, left_start_x, LEFT_X)
-  anim_x(UI.left_label, left_start_x, LEFT_X)
-  anim_x(UI.center_icon, center_start_x, CENTER_X)
-  anim_x(UI.center_label, center_start_x, CENTER_X)
-  anim_x(UI.right_icon, right_start_x, RIGHT_X)
-  anim_x(UI.right_label, right_start_x, RIGHT_X)
-  schedule_anim_done()
+  anim_x(slot.box)
+  anim_x(slot.label)
 end
 
-local function render(dir)
+local function render_initial()
   local count = #STATE.apps
   local center_item = current_item()
 
   if count <= 0 or not center_item then
-    set_triplet_content(nil, { name = (UI_TEXT[LANGUAGE] or UI_TEXT.en).no_apps }, nil)
-    set_static_positions()
+    set_slot_content(UI.slots[1], nil, true)
+    set_slot_content(UI.slots[2], { name = "NO APPS" }, false)
+    set_slot_content(UI.slots[3], nil, true)
+    UI.left, UI.center, UI.right, UI.hidden = UI.slots[1], UI.slots[2], UI.slots[3], UI.slots[4]
+    set_slot_pos(UI.left, LEFT_X)
+    set_slot_pos(UI.center, CENTER_X)
+    set_slot_pos(UI.right, RIGHT_X)
+    set_slot_pos(UI.hidden, OFFSCREEN_RIGHT_X)
     STATE.animating = false
     return
   end
 
-  local left_index = STATE.index - 1
-  if left_index < 1 then
-    left_index = count
+  UI.left, UI.center, UI.right, UI.hidden = UI.slots[1], UI.slots[2], UI.slots[3], UI.slots[4]
+  set_slot_content(UI.left, count > 1 and item_at(STATE.index - 1) or nil, true)
+  set_slot_content(UI.center, center_item, false)
+  set_slot_content(UI.right, count > 1 and item_at(STATE.index + 1) or nil, true)
+  set_slot_pos(UI.left, LEFT_X)
+  set_slot_pos(UI.center, CENTER_X)
+  set_slot_pos(UI.right, RIGHT_X)
+  set_slot_pos(UI.hidden, OFFSCREEN_RIGHT_X)
+  STATE.animating = false
+end
+
+local function show_initial_labels()
+  if not UI.initial_labels_hidden then
+    return
   end
-
-  local right_index = STATE.index + 1
-  if right_index > count then
-    right_index = 1
+  for _, slot in ipairs(UI.slots or {}) do
+    safe_set_hidden(slot.label, false)
   end
+  UI.initial_labels_hidden = false
+end
 
-  local left_item = count > 1 and STATE.apps[left_index] or nil
-  local right_item = count > 1 and STATE.apps[right_index] or nil
-  set_triplet_content(left_item, center_item, right_item)
+local function start_slide(dir)
+  local incoming = item_at(STATE.index + dir)
+  local hidden = UI.hidden
+  set_slot_content(hidden, incoming, true)
 
-  if dir == nil or dir == 0 or count < 2 then
-    set_static_positions()
-    STATE.animating = false
+  if dir > 0 then
+    style_slot(UI.left, true)
+    style_slot(UI.center, true)
+    style_slot(UI.right, false)
+    style_slot(hidden, true)
+    anim_slot(UI.left, LEFT_X, OFFSCREEN_LEFT_X)
+    anim_slot(UI.center, CENTER_X, LEFT_X)
+    anim_slot(UI.right, RIGHT_X, CENTER_X)
+    anim_slot(hidden, OFFSCREEN_RIGHT_X, RIGHT_X)
+    schedule_anim_done(function()
+      UI.left, UI.center, UI.right, UI.hidden = UI.center, UI.right, hidden, UI.left
+    end)
   else
-    start_slide(dir)
+    style_slot(hidden, true)
+    style_slot(UI.left, false)
+    style_slot(UI.center, true)
+    style_slot(UI.right, true)
+    anim_slot(hidden, OFFSCREEN_LEFT_X, LEFT_X)
+    anim_slot(UI.left, LEFT_X, CENTER_X)
+    anim_slot(UI.center, CENTER_X, RIGHT_X)
+    anim_slot(UI.right, RIGHT_X, OFFSCREEN_RIGHT_X)
+    schedule_anim_done(function()
+      UI.left, UI.center, UI.right, UI.hidden = hidden, UI.left, UI.center, UI.right
+    end)
   end
 end
 
-local function load_apps(dir)
-  local list = app.list() or {}
+local function app_list_signature(list)
+  local ids = {}
+  for _, item in ipairs(list or {}) do
+    ids[#ids + 1] = text_or(item and item.id, "")
+  end
+  table.sort(ids)
+  return table.concat(ids, "\n")
+end
+
+local function load_apps(list)
+  STATE.icon_sizes = {}
+  list = type(list) == "table" and list or (app.list() or {})
+  STATE.app_list_signature = app_list_signature(list)
   local visible = {}
   for _, item in ipairs(list) do
     if has_display_icon(item) then
@@ -746,7 +522,26 @@ local function load_apps(dir)
   end
   STATE.apps = visible
   clamp_index()
-  render(dir)
+  render_initial()
+  show_initial_labels()
+end
+
+local function start_app_list_watch()
+  if not tmr or not tmr.create then
+    return
+  end
+  local t = tmr.create()
+  STATE.app_list_timer = t
+  t:alarm(APP_LIST_POLL_MS, tmr.ALARM_AUTO, function()
+    if STATE.animating then
+      return
+    end
+    local ok, list = pcall(function() return app.list() end)
+    if ok and type(list) == "table"
+      and app_list_signature(list) ~= STATE.app_list_signature then
+      load_apps(list)
+    end
+  end)
 end
 
 local function schedule_reload(delay_ms)
@@ -761,7 +556,7 @@ local function schedule_reload(delay_ms)
     if STATE.reload_timer == self then
       STATE.reload_timer = nil
     end
-    load_apps(0)
+    load_apps()
   end)
 end
 
@@ -771,7 +566,11 @@ local function move(delta)
   end
   STATE.index = STATE.index + delta
   clamp_index()
-  render(delta)
+  if #STATE.apps < 2 then
+    render_initial()
+  else
+    start_slide(delta)
+  end
 end
 
 local launch_item
@@ -905,7 +704,7 @@ local function rescan_apps()
     print("rescan failed:", text_or(err, "unknown"))
     return
   end
-  -- 重扫会重建图标源，延后一拍再重绑，避免内置/SD 图标在同帧刷新时短暂失效。
+  -- 等待 AppManager 重扫完成，再按固定 SD 路径重新解码可见图标。
   schedule_reload(320)
 end
 
@@ -915,47 +714,29 @@ local function build_ui()
   lv_obj_set_size(UI.bg, SCREEN_W, SCREEN_H)
   style_panel(UI.bg, 0x000000, 255, 0, 0, 0x000000, 0)
 
-  UI.center_icon = lv_obj_create(root)
-  lv_obj_set_size(UI.center_icon, ICON_SIZE, ICON_SIZE)
-  lv_obj_set_pos(UI.center_icon, CENTER_X, ICON_Y)
-  UI.center_img = lv_img_create(UI.center_icon)
-  safe_set_hidden(UI.center_img, true)
-
-  UI.center_label = lv_label_create(root)
-  lv_obj_set_size(UI.center_label, ICON_SIZE, LABEL_H)
-  lv_obj_set_pos(UI.center_label, CENTER_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_label_set_long_mode(UI.center_label, LV_LABEL_LONG_CLIP)
-  style_text(UI.center_label, 0xFFFFFF, UI_FONT, LV_TEXT_ALIGN_CENTER)
-
-  UI.left_icon = lv_obj_create(root)
-  lv_obj_set_size(UI.left_icon, ICON_SIZE, ICON_SIZE)
-  lv_obj_set_pos(UI.left_icon, LEFT_X, ICON_Y)
-  UI.left_img = lv_img_create(UI.left_icon)
-  safe_set_hidden(UI.left_img, true)
-
-  UI.left_label = lv_label_create(root)
-  lv_obj_set_size(UI.left_label, ICON_SIZE, LABEL_H)
-  lv_obj_set_pos(UI.left_label, LEFT_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_label_set_long_mode(UI.left_label, LV_LABEL_LONG_CLIP)
-  style_text(UI.left_label, 0x808080, UI_FONT, LV_TEXT_ALIGN_CENTER)
-
-  UI.right_icon = lv_obj_create(root)
-  lv_obj_set_size(UI.right_icon, ICON_SIZE, ICON_SIZE)
-  lv_obj_set_pos(UI.right_icon, RIGHT_X, ICON_Y)
-  UI.right_img = lv_img_create(UI.right_icon)
-  safe_set_hidden(UI.right_img, true)
-
-  UI.right_label = lv_label_create(root)
-  lv_obj_set_size(UI.right_label, ICON_SIZE, LABEL_H)
-  lv_obj_set_pos(UI.right_label, RIGHT_X, ICON_Y + ICON_SIZE + LABEL_GAP)
-  lv_label_set_long_mode(UI.right_label, LV_LABEL_LONG_CLIP)
-  style_text(UI.right_label, 0x808080, UI_FONT, LV_TEXT_ALIGN_CENTER)
+  UI.slots = {}
+  UI.initial_labels_hidden = true
+  for i = 1, 4 do
+    local slot = {}
+    slot.box = lv_obj_create(root)
+    lv_obj_set_size(slot.box, ICON_SIZE, ICON_SIZE)
+    lv_obj_clear_flag(slot.box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE)
+    slot.canvas = create_icon_canvas(slot.box, ICON_CANVAS_SIZE, ICON_CANVAS_SIZE)
+    if not slot.canvas then error("launcher: icon canvas create failed") end
+    slot.canvas_w, slot.canvas_h = ICON_CANVAS_SIZE, ICON_CANVAS_SIZE
+    slot.label = lv_label_create(root)
+    safe_set_hidden(slot.label, true)
+    lv_obj_set_size(slot.label, ICON_SIZE, LABEL_H)
+    lv_label_set_long_mode(slot.label, LV_LABEL_LONG_CLIP)
+    style_text(slot.label, 0x808080, UI_FONT, LV_TEXT_ALIGN_CENTER)
+    UI.slots[i] = slot
+  end
 end
 
 build_ui()
-load_apps(0)
+load_apps()
+start_app_list_watch()
 sync_ntp_once()
-start_display_service()
 start_ap_policy()
 schedule_autostart()
 
@@ -1009,6 +790,30 @@ end)
 
 key.on(key.DOWN, function(evt_type, ts_ms)
   if evt_type == key.SHORT then
+    load_apps()
+  elseif evt_type == key.LONG_START then
     rescan_apps()
   end
 end)
+
+-- BLE 手柄：方向键选择，A/Menu 启动；Select/Home 在桌面不处理。
+local PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT = 1, 2, 4, 8
+local PAD_A, PAD_MENU = 16, 8192
+if controller and controller.state and tmr and tmr.create then
+  STATE.controller_timer = tmr.create()
+  STATE.controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and tonumber(pad.buttons) or 0
+    buttons = buttons or 0
+    local pressed = buttons & (~STATE.controller_buttons)
+    STATE.controller_buttons = buttons
+    if (pressed & (PAD_LEFT | PAD_UP)) ~= 0 then
+      move(-1)
+    elseif (pressed & (PAD_RIGHT | PAD_DOWN)) ~= 0 then
+      move(1)
+    elseif (pressed & (PAD_A | PAD_MENU)) ~= 0 then
+      launch_current()
+    end
+    -- PAD_SELECT / PAD_HOME intentionally do nothing in Launcher.
+  end)
+end

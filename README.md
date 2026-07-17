@@ -335,7 +335,7 @@ DevRun 适合快速试代码；确认后再整理成独立 app 目录和 `app.in
 | `POST` | `/reload` | 返回 `202` 后重新启动 DevTools service 并加载新版 `main.lua` |
 | `POST` | `/code/save` | 保存请求 body 到 DevRun main.lua |
 | `POST` | `/code/run` | 保存请求 body 并启动 DevRun |
-| `PUT` | `/upload?path=...&offset=0&total=123` | 流式上传文件；`offset` 保留给兼容/断点写入 |
+| `PUT` | `/upload?path=...&offset=0&total=123` | 兼容旧客户端的 Lua 分块上传接口 |
 | `DELETE` | `/remove?path=...` | 删除文件 |
 | `DELETE` | `/rmdir?path=...&recursive=1` | 删除目录，可递归 |
 
@@ -349,8 +349,9 @@ curl -X POST \
   "http://192.168.0.140/devtools/api/code/run"
 ```
 
-DevTools 上传使用单次 PUT 流式写入，读取 API 仍按块返回，浏览器下载走文件流；
-这些路径都不会把完整文件一次性读入 Lua 内存。
+DevTools 上传直接使用固件原生 `PUT /api/system/fs/upload?path=...`，读取 API
+仍按块返回，浏览器下载走文件流；这些路径都不会把完整文件一次性读入 Lua 内存。
+旧 `/devtools/api/upload` 仍可用于已有客户端，但经过 Lua 请求体通道，速度低于固件原生接口。
 单文件最大 64MB。
 首次从不含 `/reload` 的旧版升级时仍需重启设备一次；此后可使用页面顶部的“应用更新”。
 

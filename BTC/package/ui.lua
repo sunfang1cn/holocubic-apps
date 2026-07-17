@@ -66,6 +66,14 @@ local function set_color(id, color)
   end
 end
 
+local function set_visible(id, visible)
+  if not id then return end
+  pcall(function()
+    if visible then lv_obj_clear_flag(id, LV_OBJ_FLAG_HIDDEN)
+    else lv_obj_add_flag(id, LV_OBJ_FLAG_HIDDEN) end
+  end)
+end
+
 -- 判断字体文件是否存在，优先加载较小的中文字体，避免标的名称缺字。
 local function path_exists(path)
   if not path or path == "" then
@@ -424,6 +432,11 @@ function Ui.new(backend, i18n)
     ui_font = nil,
     ui_font_path = "",
     last_chart_key = "",
+    settings_open = false,
+    settings_index = 1,
+    settings_dim = nil,
+    settings_card = nil,
+    settings_rows = {},
   }
 
   -- 创建 LVGL 控件，一次性完成位置和文本宽度约束。
@@ -516,6 +529,92 @@ function Ui.new(backend, i18n)
     self.footer_right = lv_label_create(self.root)
     lv_obj_set_pos(self.footer_right, 170, 219)
     label_style(self.footer_right, FONT_10, C.dim, 138, ALIGN_RIGHT)
+
+    self.settings_dim = lv_obj_create(self.root)
+    lv_obj_set_pos(self.settings_dim, 0, 0)
+    lv_obj_set_size(self.settings_dim, W, H)
+    lv_obj_set_style_bg_color(self.settings_dim, 0x000000, MAIN_STYLE)
+    lv_obj_set_style_bg_opa(self.settings_dim, 150, MAIN_STYLE)
+    lv_obj_set_style_border_width(self.settings_dim, 0, MAIN_STYLE)
+
+    self.settings_card = lv_obj_create(self.root)
+    lv_obj_set_pos(self.settings_card, 44, 34)
+    lv_obj_set_size(self.settings_card, 232, 172)
+    lv_obj_set_style_bg_color(self.settings_card, C.panel_hi, MAIN_STYLE)
+    lv_obj_set_style_bg_opa(self.settings_card, 255, MAIN_STYLE)
+    lv_obj_set_style_border_color(self.settings_card, C.border, MAIN_STYLE)
+    lv_obj_set_style_border_width(self.settings_card, 1, MAIN_STYLE)
+    lv_obj_set_style_radius(self.settings_card, 10, MAIN_STYLE)
+
+    local modal_title = lv_label_create(self.settings_card)
+    lv_label_set_text(modal_title, "SETTINGS")
+    lv_obj_set_pos(modal_title, 14, 10)
+    label_style(modal_title, FONT_16, C.text, 200)
+    for i = 1, 3 do
+      local row = lv_label_create(self.settings_card)
+      lv_obj_set_pos(row, 14, 40 + (i - 1) * 32)
+      label_style(row, FONT_12, C.sub, 200)
+      self.settings_rows[i] = row
+    end
+    local modal_hint = lv_label_create(self.settings_card)
+    lv_label_set_text(modal_hint, "UP/DOWN  LEFT/RIGHT   A OK   B BACK")
+    lv_obj_set_pos(modal_hint, 14, 143)
+    label_style(modal_hint, FONT_10, C.dim, 204)
+    set_visible(self.settings_dim, false)
+    set_visible(self.settings_card, false)
+  end
+
+  function self:render_settings()
+    if not self.settings_open then return end
+    local s = self.backend.settings
+    local values = {
+      "CHART     " .. (s.mode == "candle" and "CANDLE" or "LINE"),
+      "CURRENCY  " .. tostring(s.currency or "USD"),
+      "MA        " .. ((tonumber(s.ma_period) or 0) > 0 and tostring(s.ma_period) or "OFF"),
+    }
+    for i, row in ipairs(self.settings_rows) do
+      set_text(row, (i == self.settings_index and "> " or "  ") .. values[i])
+      set_color(row, i == self.settings_index and C.line or C.sub)
+    end
+  end
+
+  function self:open_settings()
+    self.settings_open = true
+    self.settings_index = 1
+    set_visible(self.settings_dim, true)
+    set_visible(self.settings_card, true)
+    if lv_obj_move_foreground then
+      pcall(function() lv_obj_move_foreground(self.settings_dim) end)
+      pcall(function() lv_obj_move_foreground(self.settings_card) end)
+    end
+    self:render_settings()
+  end
+
+  function self:close_settings()
+    self.settings_open = false
+    set_visible(self.settings_dim, false)
+    set_visible(self.settings_card, false)
+    self:render(true)
+  end
+
+  function self:settings_move(delta)
+    self.settings_index = ((self.settings_index - 1 + delta) % 3) + 1
+    self:render_settings()
+  end
+
+  function self:settings_adjust(delta)
+    local s = self.backend.settings
+    if self.settings_index == 1 then
+      self.backend:apply_settings({mode = s.mode == "candle" and "line" or "candle"}, false)
+    elseif self.settings_index == 2 then
+      self.backend:apply_settings({currency = s.currency == "CNY" and "USD" or "CNY"}, false)
+    else
+      local options, idx = {0, 5, 10, 20}, 1
+      for i, value in ipairs(options) do if value == s.ma_period then idx = i end end
+      idx = ((idx - 1 + delta) % #options) + 1
+      self.backend:apply_settings({ma_period = options[idx]}, false)
+    end
+    self:render_settings()
   end
 
   -- 绘制空状态和错误状态。

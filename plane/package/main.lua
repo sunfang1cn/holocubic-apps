@@ -22,6 +22,7 @@ local W, H = 320, 240
 
 local STATE_PLAYING   = 1
 local STATE_GAME_OVER = 2
+local STATE_PAUSED    = 3
 
 local KEY_EVENT_SHORT = 2
 local HOME_KEYCODE = 5
@@ -1226,6 +1227,8 @@ refresh_level_ui()
 refresh_lives_ui()
 
 local state = STATE_PLAYING
+local controller_buttons = 0
+local controller_pressed = 0
 local last_ts = nil
 local start_ms = millis() or 0
 local next_fire_ms = 0
@@ -1864,6 +1867,44 @@ APP.tick_timer:alarm(20, tmr.ALARM_AUTO, function()
 
   local ts_ms = millis() or 0
 
+  -- BLE 手柄状态在游戏主循环中读取，方向支持持续按住，功能键只取上升沿。
+  local pad_lx, pad_ly = 0, 0
+  local pad_connected = false
+  if controller and controller.state then
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    if ok and type(pad) == "table" then
+      local buttons = tonumber(pad.buttons) or 0
+      controller_pressed = buttons & (~controller_buttons)
+      controller_buttons = buttons
+      pad_lx, pad_ly = tonumber(pad.lx) or 0, tonumber(pad.ly) or 0
+      pad_connected = pad.connected == true
+    else
+      controller_pressed = 0
+      controller_buttons = 0
+    end
+  end
+
+  if (controller_pressed & (4096 | 32768)) ~= 0 then
+    if APP.shutdown then APP.shutdown() end
+    pcall(function() app.exit() end)
+    return
+  end
+  if (controller_pressed & 8192) ~= 0 then
+    if state == STATE_GAME_OVER then
+      reset_game(ts_ms)
+    elseif state == STATE_PAUSED then
+      state = STATE_PLAYING
+      set_status_text("", 0)
+      last_ts = ts_ms
+    else
+      state = STATE_PAUSED
+      set_status_text("PAUSED", ts_ms + 86400000)
+    end
+  end
+  if state == STATE_GAME_OVER and (controller_pressed & 16) ~= 0 then
+    reset_game(ts_ms)
+  end
+
   if not last_ts then
     last_ts = ts_ms
   end
@@ -1888,6 +1929,10 @@ APP.tick_timer:alarm(20, tmr.ALARM_AUTO, function()
     redraw_scene()
     return
   end
+  if state == STATE_PAUSED then
+    redraw_scene()
+    return
+  end
 
   if ts_ms > status_hint_until_ms then
     if status_hint_text ~= "" then
@@ -1902,14 +1947,24 @@ APP.tick_timer:alarm(20, tmr.ALARM_AUTO, function()
   end
 
   -- player move
-  local dir = player_dir_from_pitch(filtered_pitch)
-  local speed = player_speed_from_pitch(filtered_pitch)
-  if dir ~= 0 and speed > 0 then
-    player.x = clamp(player.x + dir * speed * dt, 0, W - player.w)
+  local pad_dx = ((controller_buttons & 8) ~= 0 and 1 or 0) - ((controller_buttons & 4) ~= 0 and 1 or 0)
+  local pad_dy = ((controller_buttons & 2) ~= 0 and 1 or 0) - ((controller_buttons & 1) ~= 0 and 1 or 0)
+  if pad_dx == 0 and math.abs(pad_lx) > 6000 then pad_dx = pad_lx / 32767 end
+  if pad_dy == 0 and math.abs(pad_ly) > 6000 then pad_dy = pad_ly / 32767 end
+  if pad_dx ~= 0 or pad_dy ~= 0 then
+    local pad_speed = 180
+    player.x = clamp(player.x + pad_dx * pad_speed * dt, 0, W - player.w)
+    player.y = clamp(player.y + pad_dy * pad_speed * dt, 30, H - player.h - 6)
+  else
+    local dir = player_dir_from_pitch(filtered_pitch)
+    local speed = player_speed_from_pitch(filtered_pitch)
+    if dir ~= 0 and speed > 0 then
+      player.x = clamp(player.x + dir * speed * dt, 0, W - player.w)
+    end
   end
 
-  -- player auto fire: 随时间加快
-  if ts_ms >= next_fire_ms then
+  -- A 按住射击；射速继续使用原有随时间/分数提升规则。
+  if ((not pad_connected) or (controller_buttons & 16) ~= 0) and ts_ms >= next_fire_ms then
     fire_player(ts_ms)
     next_fire_ms = ts_ms + player_fire_interval_ms(ts_ms)
   end

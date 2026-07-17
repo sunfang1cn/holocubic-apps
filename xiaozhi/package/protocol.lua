@@ -64,7 +64,7 @@ local function device_id(cfg)
   if ok and ident and ident.device_id then
     return ident.device_id(), ident.client_id()
   end
-  return "02:00:00:00:00:01", "00000000-0000-4000-8000-020000000001"
+  return nil, nil
 end
 
 function M.new(cfg)
@@ -222,6 +222,11 @@ function M.new(cfg)
       set_error("websocket config missing")
       return false
     end
+    local id, client_id = device_id(cfg)
+    if not id or not client_id then
+      set_error("device mac unavailable")
+      return false
+    end
 
     self:close_audio_channel(false)
     self.connecting = true
@@ -234,7 +239,6 @@ function M.new(cfg)
     if token ~= "" and not token:find(" ", 1, true) then
       token = "Bearer " .. token
     end
-    local id, client_id = device_id(cfg)
     local headers = {
       ["Protocol-Version"] = tostring(cfg.websocket.version or 1),
       ["Device-Id"] = id,

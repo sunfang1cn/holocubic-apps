@@ -1441,6 +1441,21 @@ local function unbind_input()
 end
 
 local function start_polling()
+  local controller_buttons = 0
+  add_timer(40, true, function()
+    if not controller or not controller.state then return end
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      request_exit("short")
+    elseif (pressed & 4) ~= 0 then
+      handle_key(APP.input.left_code, APP.input.start_type, clock_ms())
+    elseif (pressed & 8) ~= 0 then
+      handle_key(APP.input.right_code, APP.input.start_type, clock_ms())
+    end
+  end)
   add_timer(1000, true, function()
     if app and app.exiting and app.exiting() then
       return

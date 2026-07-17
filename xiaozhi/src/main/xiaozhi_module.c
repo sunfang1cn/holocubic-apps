@@ -41,6 +41,8 @@ typedef struct xz_instance_t {
     void *audio_stream;
     int16_t *tx_pcm_scratch;
     size_t tx_pcm_scratch_bytes;
+    uint8_t *tx_opus_scratch;
+    size_t tx_opus_scratch_bytes;
 
     void *capture_stream;
     void *capture_task;
@@ -73,6 +75,11 @@ typedef struct xz_instance_t {
 
 static module_host_api_v2 s_host_store;
 static const module_host_api_v2 *s_host;
+
+#if defined(NONTHREADSAFE_PSEUDOSTACK)
+extern char *scratch_ptr;
+extern char *global_stack;
+#endif
 
 static void stop_capture(xz_instance_t *inst);
 static void free_capture_buffers(xz_instance_t *inst);
@@ -459,6 +466,11 @@ static void destroy_codecs(xz_instance_t *inst)
         inst->tx_pcm_scratch = NULL;
         inst->tx_pcm_scratch_bytes = 0;
     }
+    if (inst->tx_opus_scratch) {
+        inst->host->heap.free(inst->tx_opus_scratch);
+        inst->tx_opus_scratch = NULL;
+        inst->tx_opus_scratch_bytes = 0;
+    }
     inst->started = 0;
 }
 
@@ -488,7 +500,7 @@ static int ensure_tx_pcm_scratch(xz_instance_t *inst)
         inst->tx_pcm_scratch = NULL;
         inst->tx_pcm_scratch_bytes = 0;
     }
-    pcm = (int16_t *)inst->host->heap.malloc(need, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    pcm = (int16_t *)inst->host->heap.malloc(need, MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
     if (!pcm) {
         pcm = (int16_t *)inst->host->heap.malloc(need, MODULE_HEAP_DEFAULT);
     }
@@ -498,6 +510,34 @@ static int ensure_tx_pcm_scratch(xz_instance_t *inst)
     }
     inst->tx_pcm_scratch = pcm;
     inst->tx_pcm_scratch_bytes = need;
+    return MODULE_OK;
+}
+
+static int ensure_tx_opus_scratch(xz_instance_t *inst)
+{
+    uint8_t *opus = NULL;
+    if (!inst || !inst->host) {
+        return MODULE_ERR_INVALID_ARG;
+    }
+    if (inst->tx_opus_scratch && inst->tx_opus_scratch_bytes >= XZ_MAX_OPUS_BYTES) {
+        return MODULE_OK;
+    }
+    if (inst->tx_opus_scratch) {
+        inst->host->heap.free(inst->tx_opus_scratch);
+        inst->tx_opus_scratch = NULL;
+        inst->tx_opus_scratch_bytes = 0;
+    }
+    opus = (uint8_t *)inst->host->heap.malloc(XZ_MAX_OPUS_BYTES,
+                                              MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
+    if (!opus) {
+        opus = (uint8_t *)inst->host->heap.malloc(XZ_MAX_OPUS_BYTES, MODULE_HEAP_DEFAULT);
+    }
+    if (!opus) {
+        xz_set_error(inst, "voice.encode: no opus scratch memory");
+        return MODULE_ERR_NO_MEMORY;
+    }
+    inst->tx_opus_scratch = opus;
+    inst->tx_opus_scratch_bytes = XZ_MAX_OPUS_BYTES;
     return MODULE_OK;
 }
 
@@ -752,12 +792,14 @@ static int alloc_capture_buffers(xz_instance_t *inst, uint32_t depth)
         depth = XZ_CAPTURE_MAX_QUEUE;
     }
     free_capture_buffers(inst);
-    inst->capture_raw = (uint8_t *)host->heap.malloc(raw_bytes, MODULE_HEAP_INTERNAL | MODULE_HEAP_DMA | MODULE_HEAP_8BIT);
+    /* host i2s.read() copies from the driver's DMA ring into this CPU buffer,
+     * so it does not need DMA/internal capability. */
+    inst->capture_raw = (uint8_t *)host->heap.malloc(raw_bytes, MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
     if (!inst->capture_raw) {
         inst->capture_raw = (uint8_t *)host->heap.malloc(raw_bytes, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
     }
     inst->capture_opus = (uint8_t *)host->heap.malloc(XZ_MAX_OPUS_BYTES,
-                                                      MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+                                                      MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
     if (!inst->capture_opus) {
         inst->capture_opus = (uint8_t *)host->heap.malloc(XZ_MAX_OPUS_BYTES,
                                                           MODULE_HEAP_DEFAULT);
@@ -898,19 +940,22 @@ static void capture_task_entry(void *arg)
         }
     }
 
+    /* Complete normal I2S teardown in the worker before capture_running is
+     * cleared, so a following wake/capture owner cannot race the old stream. */
+    if (inst->capture_stream && host->i2s.end) {
+        void *stream = inst->capture_stream;
+        inst->capture_stream = NULL;
+        if (host->i2s.end(stream) != MODULE_OK) {
+            xz_set_error(inst, "voice.capture: i2s release failed");
+        }
+    }
     inst->capture_running = 0;
-    inst->capture_task = NULL;
     if (host->serial.println) {
         host->serial.println("[xiaozhi.so] capture task stop");
     }
-    if (host->task.remove) {
-        host->task.remove(NULL);
-    }
-    for (;;) {
-        if (host->task.delay) {
-            host->task.delay(1000);
-        }
-    }
+    /* Returning lets the host trampoline unregister and delete the task once.
+     * Calling remove(NULL) here and then keeping an infinite fallback loop can
+     * leave a suspended task behind on hosts whose self-delete is deferred. */
 }
 
 static void stop_capture(xz_instance_t *inst)
@@ -941,9 +986,13 @@ static void stop_capture(xz_instance_t *inst)
         }
     }
     if (inst->capture_stream && host->i2s.end) {
-        host->i2s.end(inst->capture_stream);
+        void *stream = inst->capture_stream;
         inst->capture_stream = NULL;
+        if (host->i2s.end(stream) != MODULE_OK) {
+            xz_set_error(inst, "voice.capture_stop: i2s release failed");
+        }
     }
+    inst->capture_task = NULL;
     inst->capture_stop = 0;
     inst->capture_raw_fill = 0;
     inst->capture_head = 0;
@@ -1092,18 +1141,22 @@ static int l_voice_encode(lua_State *L)
     const module_host_api_v2 *host = inst ? inst->host : s_host;
     const char *pcm = NULL;
     size_t pcm_len = 0;
-    uint8_t opus[XZ_MAX_OPUS_BYTES];
     int opus_len = 0;
     int err = MODULE_OK;
     if (!host || !inst) {
         return 0;
     }
     pcm = host->lua.checklstring(L, 1, &pcm_len);
-    err = encode_current_frame(inst, (const uint8_t *)pcm, pcm_len, opus, sizeof(opus), &opus_len);
+    err = ensure_tx_opus_scratch(inst);
+    if (err == MODULE_OK) {
+        err = encode_current_frame(inst, (const uint8_t *)pcm, pcm_len,
+                                   inst->tx_opus_scratch, inst->tx_opus_scratch_bytes,
+                                   &opus_len);
+    }
     if (err != MODULE_OK) {
         return push_error(L, host, inst->last_error);
     }
-    host->lua.pushlstring(L, (const char *)opus, (size_t)opus_len);
+    host->lua.pushlstring(L, (const char *)inst->tx_opus_scratch, (size_t)opus_len);
     return 1;
 }
 
@@ -1117,7 +1170,6 @@ static int l_voice_encode_i2s(lua_State *L)
     int gain_shift = 0;
     int16_t *pcm = NULL;
     size_t pcm_len = 0;
-    uint8_t opus[XZ_MAX_OPUS_BYTES];
     int opus_len = 0;
     int err = MODULE_OK;
     if (!host || !inst) {
@@ -1140,11 +1192,16 @@ static int l_voice_encode_i2s(lua_State *L)
     if (err != MODULE_OK) {
         return push_error(L, host, inst->last_error);
     }
-    err = encode_current_frame(inst, (const uint8_t *)pcm, pcm_len, opus, sizeof(opus), &opus_len);
+    err = ensure_tx_opus_scratch(inst);
+    if (err == MODULE_OK) {
+        err = encode_current_frame(inst, (const uint8_t *)pcm, pcm_len,
+                                   inst->tx_opus_scratch, inst->tx_opus_scratch_bytes,
+                                   &opus_len);
+    }
     if (err != MODULE_OK) {
         return push_error(L, host, inst->last_error);
     }
-    host->lua.pushlstring(L, (const char *)opus, (size_t)opus_len);
+    host->lua.pushlstring(L, (const char *)inst->tx_opus_scratch, (size_t)opus_len);
     return 1;
 }
 
@@ -1544,6 +1601,13 @@ XZ_MODULE_EXPORT void module_destroy_v1(void *instance)
         return;
     }
     destroy_codecs(inst);
+#if defined(NONTHREADSAFE_PSEUDOSTACK)
+    if (scratch_ptr && inst->host && inst->host->heap.free) {
+        inst->host->heap.free(scratch_ptr);
+        scratch_ptr = NULL;
+        global_stack = NULL;
+    }
+#endif
     if (inst->host && inst->host->heap.free) {
         inst->host->heap.free(inst);
     }

@@ -347,10 +347,31 @@ function APP.stop()
     end)
     APP.timer = nil
   end
+  if APP.controller_timer then
+    pcall_fn(function() APP.controller_timer:stop() end)
+    pcall_fn(function() APP.controller_timer:unregister() end)
+    APP.controller_timer = nil
+  end
 
   if rawget(_G, "MATRIX_RAIN_APP") == APP then
     _G.MATRIX_RAIN_APP = nil
   end
+end
+
+local function init_controller_exit()
+  if not controller or not controller.state or not tmr or not tmr.create then return end
+  local last_buttons = 0
+  APP.controller_timer = tmr.create()
+  APP.controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~last_buttons)
+    last_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      APP.stop()
+      if app and app.exit then pcall(function() app.exit() end) end
+    end
+  end)
 end
 
 local function tick()
@@ -400,6 +421,7 @@ local function init_canvas()
 end
 
 seed_random()
+init_controller_exit()
 build_fade_table()
 build_columns()
 init_root()

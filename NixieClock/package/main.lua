@@ -1455,6 +1455,23 @@ end
 
 local function start_timers()
   if not tmr or not tmr.create then return end
+  local controller_buttons = 0
+  APP.timers.controller = tmr.create()
+  APP.timers.controller:alarm(40, tmr.ALARM_AUTO, function()
+    if not controller or not controller.state then return end
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      APP.stop("controller-exit")
+      if app and app.exit then pcall(function() app.exit() end) end
+    elseif (pressed & 4) ~= 0 then
+      switch_face(-1)
+    elseif (pressed & 8) ~= 0 then
+      switch_face(1)
+    end
+  end)
   APP.timers.tick = tmr.create()
   APP.timers.tick:alarm(APP.TICK_MS, tmr.ALARM_AUTO, function()
     local ok, err = pcall_fn(tick)

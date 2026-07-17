@@ -282,8 +282,17 @@ function M.new(cfg)
     end
     local ident = identity(self.cfg)
     local id = ident.device_id()
-    local headers = ident.http_headers(self.cfg)
-    local body_text = encode_body(self.cfg, id)
+    if not id then
+      return nil, "device mac unavailable", true
+    end
+    local headers, headers_err = ident.http_headers(self.cfg)
+    if not headers then
+      return nil, headers_err or "device mac unavailable", true
+    end
+    local body_text, body_err = encode_body(self.cfg, id)
+    if not body_text then
+      return nil, body_err or "device identity unavailable", true
+    end
     print("[xiaozhi] ota check", ota_url, headers["Device-Id"], headers["Client-Id"])
     local code, body = http.post(ota_url, {
       headers = headers,
@@ -302,7 +311,10 @@ function M.new(cfg)
     if not http or not http.post then
       return nil, "http api missing"
     end
-    local headers = identity(self.cfg).http_headers(self.cfg)
+    local headers, headers_err = identity(self.cfg).http_headers(self.cfg)
+    if not headers then
+      return nil, headers_err or "device mac unavailable"
+    end
     local code, body = http.post(normalize_activate_url(self.cfg.ota.url), {
       headers = headers,
       timeout = self.cfg.ota.timeout_ms or 10000,
@@ -327,14 +339,38 @@ function M.new(cfg)
 
   local check_again
   local poll_activate
+  local start_after_identity_ready
+
+  start_after_identity_ready = function()
+    if not self.active then
+      return
+    end
+    local ident = identity(self.cfg)
+    local id = ident.device_id()
+    if not id or not ident.client_id(id) then
+      emit("waiting_mac", "device mac unavailable")
+      schedule(1000, start_after_identity_ready)
+      return
+    end
+    if self.cfg.websocket and self.cfg.websocket.url ~= "" and not self.cfg.ota.force then
+      finish(true, "configured")
+      return
+    end
+    schedule(10, check_again)
+  end
 
   check_again = function()
     if not self.active then
       return
     end
     emit("checking", nil)
-    local res, err = request_ota()
+    local res, err, waiting_mac = request_ota()
     if not res then
+      if waiting_mac then
+        emit("waiting_mac", err)
+        schedule(1000, check_again)
+        return
+      end
       finish(false, err)
       return
     end
@@ -403,18 +439,17 @@ function M.new(cfg)
 
   function self:start(callback)
     self.callback = callback
-    if not self.cfg.ota or self.cfg.ota.enabled == false then
+    local websocket_configured = self.cfg.websocket and self.cfg.websocket.url ~= "" and
+        self.cfg.ota and not self.cfg.ota.force
+    if (not self.cfg.ota or self.cfg.ota.enabled == false) and not websocket_configured then
       return false, "ota disabled"
     end
-    if self.cfg.websocket and self.cfg.websocket.url ~= "" and not self.cfg.ota.force then
-      return false, "websocket configured"
-    end
-    if not self.cfg.ota.url or self.cfg.ota.url == "" then
+    if not websocket_configured and (not self.cfg.ota.url or self.cfg.ota.url == "") then
       emit("need_config", "未配置 ota.url")
       return false, "ota url missing"
     end
     self.active = true
-    schedule(10, check_again)
+    schedule(10, start_after_identity_ready)
     return true
   end
 

@@ -14,18 +14,27 @@
 #endif
 
 #define WAKE_MODULE_EXPORT __attribute__((visibility("default"), used))
-#define WAKE_VERSION "0.2.1"
+#define WAKE_VERSION "0.3.0"
 #define WAKE_ENGINE "WakeNet9s"
 #define WAKE_MODEL "wn9s_nihaoxiaozhi"
 #define WAKE_WORD "你好小智"
-#define WAKE_MODEL_PATH "/sd/apps/xiaozhi/wake"
-#define WAKE_MODEL_DIR WAKE_MODEL_PATH "/" WAKE_MODEL
+#define WAKE_STRINGIFY_INNER(value) #value
+#define WAKE_STRINGIFY(value) WAKE_STRINGIFY_INNER(value)
+#ifndef WAKE_MODEL_PATH
+#define WAKE_MODEL_PATH /sd/apps/xiaozhi/wake
+#endif
+#define WAKE_MODEL_PATH_STRING WAKE_STRINGIFY(WAKE_MODEL_PATH)
+#define WAKE_MODEL_DIR WAKE_MODEL_PATH_STRING "/" WAKE_MODEL
 #define WAKE_MODEL_INDEX_FILE WAKE_MODEL_DIR "/wn9_index"
 #define WAKE_MODEL_DATA_FILE WAKE_MODEL_DIR "/wn9_data"
 #define WAKE_SAMPLE_RATE 16000u
 #define WAKE_BITS_PER_SAMPLE 16u
 #define WAKE_CHANNELS 1u
 #define WAKE_SYNTH_CHUNKS 64u
+#define WAKE_CAPTURE_DEFAULT_STACK 8192u
+#define WAKE_CAPTURE_DEFAULT_PRIORITY 2u
+#define WAKE_CAPTURE_DEFAULT_CORE 0
+#define WAKE_CAPTURE_DEFAULT_TIMEOUT_MS 100u
 
 #if defined(WAKE_USE_ESP_SR) && WAKE_USE_ESP_SR
 #define WAKE_REAL_BACKEND 1
@@ -50,6 +59,19 @@ typedef struct wake_instance_t {
     int32_t model_count;
     int16_t *chunk_scratch;
     size_t chunk_scratch_bytes;
+    void *capture_stream;
+    void *capture_task;
+    uint8_t *capture_raw;
+    size_t capture_raw_bytes;
+    size_t capture_raw_fill;
+    volatile uint8_t capture_running;
+    volatile uint8_t capture_stop;
+    volatile uint32_t capture_detections;
+    uint32_t capture_reported_detections;
+    uint32_t capture_frames;
+    uint32_t capture_read_timeout_ms;
+    int capture_gain_shift;
+    char capture_pack[4];
     char last_error[128];
 #if WAKE_REAL_BACKEND
     srmodel_list_t *models;
@@ -62,6 +84,8 @@ static const module_host_api_v2 *s_host = NULL;
 #if WAKE_REAL_BACKEND
 static srmodel_list_t *s_wake_static_srmodels = NULL;
 #endif
+
+static void wake_capture_stop(wake_instance_t *inst);
 
 #define WAKE_ALLOC_MAGIC 0x57414C4Cu
 #define WAKE_FILE_MAGIC 0x57464C45u
@@ -125,13 +149,28 @@ static int wake_heap_ready(void)
 static void *wake_heap_malloc(size_t size, uint32_t caps)
 {
     void *ptr = NULL;
+    uint32_t requested_caps = MODULE_HEAP_DEFAULT;
     if (size == 0) {
         size = 1;
     }
     if (!wake_heap_ready()) {
         return NULL;
     }
-    ptr = s_host->heap.malloc(size, wake_heap_caps_from_idf(caps));
+    requested_caps = wake_heap_caps_from_idf(caps);
+    /* ESP-SR asks for several non-DMA work buffers with INTERNAL set.  They
+     * are ordinary cached inference data, so prefer PSRAM for those blocks.
+     * Keep real DMA allocations in internal RAM and retain the exact request
+     * as the fallback for compatibility. */
+    if ((caps & WAKE_MALLOC_CAP_INTERNAL) && !(caps & WAKE_MALLOC_CAP_DMA)) {
+        uint32_t psram_caps = MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT;
+        if (caps & WAKE_MALLOC_CAP_32BIT) {
+            psram_caps |= MODULE_HEAP_32BIT;
+        }
+        ptr = s_host->heap.malloc(size, psram_caps);
+    }
+    if (!ptr) {
+        ptr = s_host->heap.malloc(size, requested_caps);
+    }
     if (!ptr) {
         ptr = s_host->heap.malloc(size, MODULE_HEAP_DEFAULT);
     }
@@ -458,13 +497,18 @@ void *heap_caps_malloc(size_t size, uint32_t caps)
 
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps)
 {
+    void *ptr = NULL;
     if (size && n > ((size_t)-1) / size) {
         return NULL;
     }
     if (!wake_heap_ready()) {
         return NULL;
     }
-    return s_host->heap.calloc(n, size, wake_heap_caps_from_idf(caps));
+    ptr = wake_heap_malloc(n * size, caps);
+    if (ptr) {
+        memset(ptr, 0, n * size);
+    }
+    return ptr;
 }
 
 void *heap_caps_aligned_alloc(size_t alignment, size_t size, uint32_t caps)
@@ -976,6 +1020,38 @@ static void set_boolean_field(lua_State *L, const module_host_api_v2 *host, cons
     host->lua.setfield(L, -2, key);
 }
 
+static int wake_read_int_field(lua_State *L,
+                               const module_host_api_v2 *host,
+                               int table_idx,
+                               const char *key,
+                               int fallback)
+{
+    int value = fallback;
+    const int top = host->lua.gettop(L);
+    host->lua.getfield(L, table_idx, key);
+    if (host->lua.isnumber(L, -1)) {
+        value = (int)host->lua.tointeger(L, -1);
+    }
+    host->lua.settop(L, top);
+    return value;
+}
+
+static const char *wake_read_string_field(lua_State *L,
+                                          const module_host_api_v2 *host,
+                                          int table_idx,
+                                          const char *key,
+                                          const char *fallback)
+{
+    const char *value = fallback;
+    const int top = host->lua.gettop(L);
+    host->lua.getfield(L, table_idx, key);
+    if (host->lua.isstring(L, -1)) {
+        value = host->lua.tostring(L, -1);
+    }
+    host->lua.settop(L, top);
+    return value ? value : fallback;
+}
+
 /**
  * @brief Register a Lua C closure that captures this module instance.
  */
@@ -1149,7 +1225,7 @@ static int wake_required_model_files_ready(wake_instance_t *inst, const char **o
  */
 char *get_model_base_path(void)
 {
-    return (char *)WAKE_MODEL_PATH;
+    return (char *)WAKE_MODEL_PATH_STRING;
 }
 
 /**
@@ -1307,7 +1383,7 @@ static int wake_ensure_chunk_scratch(wake_instance_t *inst, size_t chunk_bytes)
         inst->chunk_scratch = NULL;
         inst->chunk_scratch_bytes = 0;
     }
-    scratch = (int16_t *)inst->host->heap.malloc(chunk_bytes, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    scratch = (int16_t *)inst->host->heap.malloc(chunk_bytes, MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
     if (!scratch) {
         scratch = (int16_t *)inst->host->heap.malloc(chunk_bytes, MODULE_HEAP_DEFAULT);
     }
@@ -1669,6 +1745,146 @@ static int wake_feed_i2s32_bytes(wake_instance_t *inst,
 }
 #endif
 
+static void wake_copy_pack(char out[4], const char *pack)
+{
+    if (!pack || (strcmp(pack, "b01") != 0 && strcmp(pack, "b12") != 0 && strcmp(pack, "b23") != 0)) {
+        pack = "b23";
+    }
+    out[0] = pack[0];
+    out[1] = pack[1];
+    out[2] = pack[2];
+    out[3] = '\0';
+}
+
+static void wake_capture_task_entry(void *arg)
+{
+    wake_instance_t *inst = (wake_instance_t *)arg;
+    const module_host_api_v2 *host = inst ? inst->host : NULL;
+    if (!inst || !host || !host->i2s.read) {
+        return;
+    }
+    if (host->serial.println) {
+        host->serial.println("[wake.so] capture task start");
+    }
+
+    while (!inst->capture_stop) {
+        size_t got = 0;
+        const size_t need = inst->capture_raw_bytes - inst->capture_raw_fill;
+        uint32_t frames = 0;
+        uint32_t detected = 0;
+        int32_t state = 0;
+        int err = MODULE_OK;
+
+        if (host->diag.heartbeat) {
+            host->diag.heartbeat();
+        }
+        if (!inst->capture_stream || !inst->capture_raw || need == 0) {
+            break;
+        }
+        err = host->i2s.read(inst->capture_stream,
+                             inst->capture_raw + inst->capture_raw_fill,
+                             need,
+                             &got,
+                             inst->capture_read_timeout_ms);
+        if (err != MODULE_OK) {
+            wake_set_error(inst, "wake.capture: i2s read failed");
+            break;
+        }
+        if (got == 0) {
+            if (host->task.delay) {
+                host->task.delay(1);
+            }
+            continue;
+        }
+        inst->capture_raw_fill += got;
+        if (inst->capture_raw_fill < inst->capture_raw_bytes) {
+            continue;
+        }
+
+        err = wake_feed_i2s32_bytes(inst,
+                                    inst->capture_raw,
+                                    inst->capture_raw_bytes,
+                                    inst->capture_pack,
+                                    inst->capture_gain_shift,
+                                    &frames,
+                                    &detected,
+                                    &state);
+        inst->capture_raw_fill = 0;
+        if (err != MODULE_OK) {
+            break;
+        }
+        inst->feed_count++;
+        inst->capture_frames += frames;
+        if (detected > 0) {
+            inst->capture_detections += detected;
+        }
+        if (host->task.yield) {
+            host->task.yield();
+        }
+    }
+
+    /* Release I2S before publishing the stopped state.  capture_stop() may run
+     * on the Lua task; making the worker perform the normal release closes the
+     * window where Lua observes capture_running == 0 while the port is still
+     * owned by this module. */
+    if (inst->capture_stream && host->i2s.end) {
+        void *stream = inst->capture_stream;
+        inst->capture_stream = NULL;
+        if (host->i2s.end(stream) != MODULE_OK) {
+            wake_set_error(inst, "wake.capture: i2s release failed");
+        }
+    }
+    inst->capture_running = 0;
+    if (host->serial.println) {
+        host->serial.println("[wake.so] capture task stop");
+    }
+    /* The host task trampoline owns task unregister/delete after return. */
+}
+
+static void wake_capture_stop(wake_instance_t *inst)
+{
+    const module_host_api_v2 *host = inst ? inst->host : NULL;
+    uint32_t start_ms = 0;
+    if (!inst || !host) {
+        return;
+    }
+    inst->capture_stop = 1;
+    start_ms = host->time.millis ? host->time.millis() : 0;
+    while (inst->capture_running && inst->capture_task) {
+        const uint32_t now = host->time.millis ? host->time.millis() : start_ms + 1000u;
+        if (now - start_ms > 1500u) {
+            if (host->task.remove && inst->capture_task) {
+                host->task.remove(inst->capture_task);
+            }
+            inst->capture_running = 0;
+            inst->capture_task = NULL;
+            break;
+        }
+        if (host->task.delay) {
+            host->task.delay(10);
+        } else if (host->time.delay) {
+            host->time.delay(10);
+        } else {
+            break;
+        }
+    }
+    if (inst->capture_stream && host->i2s.end) {
+        void *stream = inst->capture_stream;
+        inst->capture_stream = NULL;
+        if (host->i2s.end(stream) != MODULE_OK) {
+            wake_set_error(inst, "wake.capture_stop: i2s release failed");
+        }
+    }
+    inst->capture_task = NULL;
+    if (inst->capture_raw && host->heap.free) {
+        host->heap.free(inst->capture_raw);
+    }
+    inst->capture_raw = NULL;
+    inst->capture_raw_bytes = 0;
+    inst->capture_raw_fill = 0;
+    inst->capture_stop = 0;
+}
+
 /**
  * @brief Push a status table shared by info(), feed(), and selftest().
  */
@@ -1679,7 +1895,7 @@ static void push_status_table(lua_State *L, const module_host_api_v2 *host, wake
     set_string_field(L, host, "engine", WAKE_ENGINE);
     set_string_field(L, host, "model", WAKE_MODEL);
     set_string_field(L, host, "word", WAKE_WORD);
-    set_string_field(L, host, "model_path", WAKE_MODEL_PATH);
+    set_string_field(L, host, "model_path", WAKE_MODEL_PATH_STRING);
     set_string_field(L, host, "backend", WAKE_REAL_BACKEND ? "esp-sr" : "synthetic");
     set_boolean_field(L, host, "real_backend", WAKE_REAL_BACKEND);
     set_boolean_field(L, host, "initialized", wake_is_initialized(inst));
@@ -1696,6 +1912,9 @@ static void push_status_table(lua_State *L, const module_host_api_v2 *host, wake
     set_integer_field(L, host, "samples_fed", inst ? inst->samples_fed : 0);
     set_integer_field(L, host, "last_state", inst ? inst->last_state : 0);
     set_boolean_field(L, host, "last_detected", inst && inst->last_detected);
+    set_boolean_field(L, host, "capture_running", inst && inst->capture_running);
+    set_integer_field(L, host, "capture_frames", inst ? inst->capture_frames : 0);
+    set_integer_field(L, host, "capture_detections", inst ? inst->capture_detections : 0);
     set_string_field(L, host, "last_error", inst ? inst->last_error : "");
 }
 
@@ -1742,6 +1961,7 @@ static int l_stop(lua_State *L)
     if (!host || !inst) {
         return 0;
     }
+    wake_capture_stop(inst);
     wake_deinit_backend(inst);
     host->lua.pushboolean(L, 1);
     return 1;
@@ -1802,7 +2022,7 @@ static int l_selftest(lua_State *L)
     set_string_field(L, host, "word", WAKE_WORD);
     set_string_field(L, host, "engine", WAKE_ENGINE);
     set_string_field(L, host, "model", WAKE_MODEL);
-    set_string_field(L, host, "model_path", WAKE_MODEL_PATH);
+    set_string_field(L, host, "model_path", WAKE_MODEL_PATH_STRING);
     set_string_field(L, host, "backend", WAKE_REAL_BACKEND ? "esp-sr" : "synthetic");
     set_boolean_field(L, host, "real_backend", WAKE_REAL_BACKEND);
     set_integer_field(L, host, "sample_rate", inst->sample_rate ? inst->sample_rate : WAKE_SAMPLE_RATE);
@@ -1926,6 +2146,161 @@ static int l_feed_i2s(lua_State *L)
     return 1;
 }
 
+/**
+ * @brief Lua: wake.capture_start([config]) -> true | nil, err.
+ *
+ * The native task owns I2S RX and runs WakeNet. Lua only polls
+ * capture_read(), so inference never blocks the Lua timer task.
+ */
+static int l_capture_start(lua_State *L)
+{
+    wake_instance_t *inst = instance_from_lua(L);
+    const module_host_api_v2 *host = inst ? inst->host : s_host;
+    module_i2s_config_t cfg;
+    void *stream = NULL;
+    void *task = NULL;
+    int cfg_idx = 0;
+    int stack_bytes = (int)WAKE_CAPTURE_DEFAULT_STACK;
+    int priority = (int)WAKE_CAPTURE_DEFAULT_PRIORITY;
+    int core = WAKE_CAPTURE_DEFAULT_CORE;
+    const char *pack = "b23";
+    int err = MODULE_OK;
+
+    if (!host || !inst) {
+        return 0;
+    }
+    if (!host->i2s.begin || !host->i2s.read || !host->i2s.end ||
+        !host->task.create_ex || !host->task.remove || !host->task.delay) {
+        return push_error(L, host, "wake.capture_start: host i2s/task API missing");
+    }
+    if (inst->capture_running) {
+        host->lua.pushboolean(L, 1);
+        return 1;
+    }
+    err = wake_init_backend(inst);
+    if (err != MODULE_OK) {
+        return push_error(L, host, inst->last_error);
+    }
+
+    cfg_idx = host->lua.gettop(L) >= 1 && host->lua.istable(L, 1) ? 1 : 0;
+    stack_bytes = cfg_idx ? wake_read_int_field(L, host, cfg_idx, "task_stack", stack_bytes) : stack_bytes;
+    priority = cfg_idx ? wake_read_int_field(L, host, cfg_idx, "priority", priority) : priority;
+    core = cfg_idx ? wake_read_int_field(L, host, cfg_idx, "core", core) : core;
+    inst->capture_gain_shift = cfg_idx ? wake_read_int_field(L, host, cfg_idx, "gain_shift", 0) : 0;
+    inst->capture_read_timeout_ms = (uint32_t)(cfg_idx ? wake_read_int_field(
+        L, host, cfg_idx, "read_timeout_ms", (int)WAKE_CAPTURE_DEFAULT_TIMEOUT_MS)
+        : (int)WAKE_CAPTURE_DEFAULT_TIMEOUT_MS);
+    pack = cfg_idx ? wake_read_string_field(L, host, cfg_idx, "pack", "b23") : "b23";
+    wake_copy_pack(inst->capture_pack, pack);
+
+    if (stack_bytes < (int)WAKE_CAPTURE_DEFAULT_STACK) stack_bytes = (int)WAKE_CAPTURE_DEFAULT_STACK;
+    if (priority < 1) priority = 1;
+    if (priority > 10) priority = 10;
+    if (core < -1 || core > 1) core = WAKE_CAPTURE_DEFAULT_CORE;
+    if (inst->capture_read_timeout_ms < 1) inst->capture_read_timeout_ms = 1;
+    inst->capture_raw_bytes = (size_t)inst->chunk_samples * (size_t)inst->channel_count * 4u;
+    /* i2s_read copies out of the driver's internal DMA ring; this destination
+     * is a CPU buffer and can live in PSRAM. */
+    inst->capture_raw = (uint8_t *)host->heap.malloc(
+        inst->capture_raw_bytes, MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
+    if (!inst->capture_raw) {
+        inst->capture_raw = (uint8_t *)host->heap.malloc(
+            inst->capture_raw_bytes, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    }
+    if (!inst->capture_raw) {
+        inst->capture_raw_bytes = 0;
+        return push_error(L, host, "wake.capture_start: no capture buffer");
+    }
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.size = sizeof(cfg);
+    cfg.port = (uint8_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "i2s_id", 0) : 0);
+    cfg.mode = MODULE_I2S_MODE_RX;
+    cfg.sample_rate = WAKE_SAMPLE_RATE;
+    cfg.bits = (uint16_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "bits", 32) : 32);
+    cfg.channels = 1;
+    cfg.format = MODULE_I2S_FORMAT_I2S;
+    cfg.channel_mode = MODULE_I2S_CHANNEL_MONO_LEFT;
+    cfg.bclk_pin = (int16_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "bclk_pin", 41) : 41);
+    cfg.ws_pin = (int16_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "ws_pin", 45) : 45);
+    cfg.dout_pin = -1;
+    cfg.din_pin = (int16_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "din_pin", 42) : 42);
+    cfg.mclk_pin = -1;
+    cfg.dma_buf_count = (uint16_t)(cfg_idx ? wake_read_int_field(L, host, cfg_idx, "buffer_count", 4) : 4);
+    cfg.dma_buf_len = (uint16_t)(cfg_idx ? wake_read_int_field(
+        L, host, cfg_idx, "buffer_len", inst->chunk_samples) : inst->chunk_samples);
+
+    err = host->i2s.begin(&cfg, &stream);
+    if (err != MODULE_OK || !stream) {
+        host->heap.free(inst->capture_raw);
+        inst->capture_raw = NULL;
+        inst->capture_raw_bytes = 0;
+        return push_error(L, host, "wake.capture_start: i2s busy or unavailable");
+    }
+    inst->capture_stream = stream;
+    inst->capture_raw_fill = 0;
+    inst->capture_stop = 0;
+    inst->capture_running = 1;
+    inst->capture_frames = 0;
+    inst->capture_detections = 0;
+    inst->capture_reported_detections = 0;
+    wake_set_error(inst, "");
+
+    err = host->task.create_ex("wake_capture",
+                               wake_capture_task_entry,
+                               inst,
+                               (uint32_t)stack_bytes,
+                               (uint32_t)priority,
+                               core,
+                               MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT,
+                               &task);
+    if (err != MODULE_OK || !task) {
+        inst->capture_running = 0;
+        wake_capture_stop(inst);
+        return push_error(L, host, "wake.capture_start: task create failed");
+    }
+    inst->capture_task = task;
+    host->lua.pushboolean(L, 1);
+    return 1;
+}
+
+/** @brief Lua: wake.capture_read() -> status table. */
+static int l_capture_read(lua_State *L)
+{
+    wake_instance_t *inst = instance_from_lua(L);
+    const module_host_api_v2 *host = inst ? inst->host : s_host;
+    uint32_t total = 0;
+    uint32_t detections = 0;
+    if (!host || !inst) {
+        return 0;
+    }
+    total = inst->capture_detections;
+    detections = total - inst->capture_reported_detections;
+    inst->capture_reported_detections = total;
+    host->lua.createtable(L, 0, 8);
+    set_boolean_field(L, host, "ok", inst->capture_running || inst->last_error[0] == '\0');
+    set_boolean_field(L, host, "running", inst->capture_running);
+    set_boolean_field(L, host, "detected", detections > 0);
+    set_integer_field(L, host, "detections", detections);
+    set_integer_field(L, host, "frames", inst->capture_frames);
+    set_integer_field(L, host, "state", inst->last_state);
+    set_string_field(L, host, "error", inst->last_error);
+    return 1;
+}
+
+/** @brief Lua: wake.capture_stop() -> true. */
+static int l_capture_stop(lua_State *L)
+{
+    wake_instance_t *inst = instance_from_lua(L);
+    const module_host_api_v2 *host = inst ? inst->host : s_host;
+    if (!host || !inst) {
+        return 0;
+    }
+    wake_capture_stop(inst);
+    host->lua.pushboolean(L, 1);
+    return 1;
+}
+
 WAKE_MODULE_EXPORT const module_manifest_t *module_query_v1(void)
 {
     return &s_manifest;
@@ -1995,7 +2370,7 @@ WAKE_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
     set_string_field(L, host, "ENGINE", WAKE_ENGINE);
     set_string_field(L, host, "MODEL", WAKE_MODEL);
     set_string_field(L, host, "WORD", WAKE_WORD);
-    set_string_field(L, host, "MODEL_PATH", WAKE_MODEL_PATH);
+    set_string_field(L, host, "MODEL_PATH", WAKE_MODEL_PATH_STRING);
     set_boolean_field(L, host, "REAL_BACKEND", WAKE_REAL_BACKEND);
     set_integer_field(L, host, "SAMPLE_RATE", WAKE_SAMPLE_RATE);
     set_function_field(L, host, "info", l_info, inst);
@@ -2006,6 +2381,9 @@ WAKE_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
     set_function_field(L, host, "selftest", l_selftest, inst);
     set_function_field(L, host, "feed", l_feed, inst);
     set_function_field(L, host, "feed_i2s", l_feed_i2s, inst);
+    set_function_field(L, host, "capture_start", l_capture_start, inst);
+    set_function_field(L, host, "capture_read", l_capture_read, inst);
+    set_function_field(L, host, "capture_stop", l_capture_stop, inst);
     return MODULE_OK;
 }
 
@@ -2015,6 +2393,7 @@ WAKE_MODULE_EXPORT void module_destroy_v1(void *instance)
     if (!inst) {
         return;
     }
+    wake_capture_stop(inst);
     wake_destroy_backend(inst);
     if (inst->host && inst->host->serial.println) {
         inst->host->serial.println("[wake.so] destroy");

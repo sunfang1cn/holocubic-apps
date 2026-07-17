@@ -1127,6 +1127,38 @@ update_center_time(true)
 redraw()
 APP_STATE.register_mode_key_handlers()
 
+if controller and controller.state and tmr and tmr.create then
+  local controller_buttons = 0
+  local controller_horizontal = 0
+  local controller_hold_ms = 0
+  local controller_long_fired = false
+  APP_STATE.controller_timer = tmr.create()
+  APP_STATE.controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then
+      APP_STATE.stop()
+      if app and app.exit then pcall(function() app.exit() end) end
+      return
+    end
+    local horizontal = buttons & (4 | 8)
+    local stamp = millis and (millis() or 0) or 0
+    if horizontal == 0 then
+      controller_horizontal = 0
+      controller_long_fired = false
+    elseif horizontal ~= controller_horizontal then
+      controller_horizontal = horizontal
+      controller_hold_ms = stamp
+      controller_long_fired = false
+    elseif not controller_long_fired and stamp - controller_hold_ms >= 600 then
+      controller_long_fired = true
+      APP_STATE.toggle_visual_mode()
+    end
+  end)
+end
+
 if audio and audio.start then
   audio.start(copy_raw_bins)
 end
@@ -1148,6 +1180,11 @@ if tmr and tmr.create then
 end
 
 APP_STATE.stop = function()
+  if APP_STATE.controller_timer then
+    pcall_fn(function() APP_STATE.controller_timer:stop() end)
+    pcall_fn(function() APP_STATE.controller_timer:unregister() end)
+    APP_STATE.controller_timer = nil
+  end
   if APP_STATE.timer then
     pcall_fn(function() APP_STATE.timer:stop() end)
     pcall_fn(function() APP_STATE.timer:unregister() end)

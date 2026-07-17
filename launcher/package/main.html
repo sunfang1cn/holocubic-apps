@@ -3499,66 +3499,84 @@ function setAutoSleepControl(seconds){
   if(select) select.value = String(normalized);
 }
 
-async function applyAutoSleepNow(seconds){
-  const normalized = normalizeAutoSleepSeconds(seconds, DEFAULT_AUTO_SLEEP_ENABLED ? DEFAULT_AUTO_SLEEP_SECONDS : 0);
-  const on = normalized > 0;
-  const response = await fetch(
-    "/display/api/sleep?enabled=" + encodeURIComponent(on ? "true" : "false") +
-      "&seconds=" + encodeURIComponent(String(on ? normalized : DEFAULT_AUTO_SLEEP_SECONDS)),
-    {
-      method: "POST",
-      cache: "no-store"
-    }
-  );
+const DISPLAY_SETTINGS_UNAVAILABLE_ERROR = "显示设置接口不可用，请确认固件为 1.200 及以上版本";
+
+async function parseDisplaySettingsResponse(response){
+  let responseText = "";
   let data = null;
   try{
-    data = await response.json();
+    responseText = await response.text();
+    data = responseText ? JSON.parse(responseText) : null;
   }catch(err){
     data = null;
   }
-  if(!response.ok || !data || data.ok === false){
-    throw new Error(data && data.error ? data.error : ("HTTP " + response.status));
+  if(!response.ok || (data && data.ok === false)){
+    throw new Error(data && data.error
+      ? data.error
+      : ("显示设置接口请求失败（HTTP " + response.status + "）"));
+  }
+  if(!data){
+    throw new Error(responseText
+      ? "显示设置接口返回格式异常"
+      : "显示设置接口未返回数据");
   }
   return data;
 }
 
-async function applyBrightnessNow(value){
-  const brightness = normalizeBrightness(value, DEFAULT_BRIGHTNESS);
-  const response = await fetch("/display/api/brightness?value=" + encodeURIComponent(String(brightness)), {
+async function readDisplaySettingsNow(){
+  const response = await fetch("/display/api/settings", { method: "GET", cache: "no-store" });
+  return parseDisplaySettingsResponse(response);
+}
+
+async function applyDisplaySettingsNow(values){
+  const input = values || {};
+  const brightness = normalizeBrightness(
+    input.brightness != null ? input.brightness : (qs("#brightnessRange") && qs("#brightnessRange").value),
+    DEFAULT_BRIGHTNESS
+  );
+  const sleepSeconds = normalizeAutoSleepSeconds(
+    input.auto_sleep_seconds != null ? input.auto_sleep_seconds : (qs("#autoSleepSelect") && qs("#autoSleepSelect").value),
+    0
+  );
+  const sleepEnabled = input.auto_sleep_enabled != null ? !!input.auto_sleep_enabled : sleepSeconds > 0;
+  const query = new URLSearchParams({
+    brightness: String(brightness),
+    auto_sleep_enabled: sleepEnabled ? "true" : "false",
+    auto_sleep_seconds: String(sleepEnabled ? sleepSeconds : DEFAULT_AUTO_SLEEP_SECONDS)
+  });
+  const response = await fetch("/display/api/settings?" + query.toString(), {
     method: "POST",
     cache: "no-store"
   });
-  let data = null;
-  try{
-    data = await response.json();
-  }catch(err){
-    data = null;
-  }
-  if(!response.ok || !data || data.ok === false){
-    throw new Error(data && data.error ? data.error : ("HTTP " + response.status));
-  }
-  return data;
+  return parseDisplaySettingsResponse(response);
 }
 
 async function wakeDisplayNow(){
-  const response = await fetch("/display/api/wake", {
-    method: "POST",
-    cache: "no-store"
-  });
-  if(!response.ok){
-    const brightness = normalizeBrightness(qs("#brightnessRange") && qs("#brightnessRange").value, DEFAULT_BRIGHTNESS);
-    await applyBrightnessNow(brightness);
-    return null;
-  }
-  return response;
+  return applyDisplaySettingsNow({});
 }
 
 function scheduleBrightnessApply(value){
   const brightness = normalizeBrightness(value, DEFAULT_BRIGHTNESS);
   window.clearTimeout(brightnessApplyTimer);
   brightnessApplyTimer = window.setTimeout(() => {
-    applyBrightnessNow(brightness).catch((err) => showToast("亮度服务未响应：" + (err.message || String(err)), true));
+    applyDisplaySettingsNow({ brightness }).catch((err) => showToast(err.message || String(err), true));
   }, 80);
+}
+
+async function loadDisplaySettingsControls(){
+  const data = await readDisplaySettingsNow();
+  const brightness = normalizeBrightness(data.brightness, DEFAULT_BRIGHTNESS);
+  const sleepEnabled = normalizeBool(data.auto_sleep_enabled, DEFAULT_AUTO_SLEEP_ENABLED);
+  const sleepSeconds = normalizeAutoSleepSeconds(
+    sleepEnabled ? data.auto_sleep_seconds : 0,
+    sleepEnabled ? DEFAULT_AUTO_SLEEP_SECONDS : 0
+  );
+  setBrightnessControl(brightness);
+  setAutoSleepControl(sleepSeconds);
+  storageSet(STORAGE_KEYS.brightness, String(brightness));
+  storageSet(STORAGE_KEYS.autoSleepEnabled, sleepEnabled ? "true" : "false");
+  storageSet(STORAGE_KEYS.autoSleepSeconds, String(sleepSeconds));
+  return data;
 }
 
 function autostartAppItems(data){
@@ -6737,14 +6755,17 @@ async function saveSettings(ev){
     await uploadJsonFile(SETTINGS_JSON_PATH, payload);
     let brightnessError = null;
     try{
-      await applyBrightnessNow(payload.brightness);
-      await applyAutoSleepNow(payload.auto_sleep_enabled ? payload.auto_sleep_seconds : 0);
+      await applyDisplaySettingsNow({
+        brightness: payload.brightness,
+        auto_sleep_enabled: payload.auto_sleep_enabled,
+        auto_sleep_seconds: payload.auto_sleep_seconds
+      });
     }catch(err){
       brightnessError = err;
     }
     latestDeviceSettings = Object.assign({}, payload);
     if(brightnessError){
-      showToast("已保存到设备；亮度服务暂未响应，重进 Launcher 后会自动拉起。", true);
+      showToast(brightnessError.message || DISPLAY_SETTINGS_UNAVAILABLE_ERROR, true);
     }else{
       showToast("已保存到设备", false);
     }
@@ -6905,7 +6926,11 @@ qs("#brightnessRange").addEventListener("input", (ev) => {
   scheduleBrightnessApply(ev.target.value);
 });
 qs("#autoSleepSelect").addEventListener("change", (ev) => {
-  applyAutoSleepNow(ev.target.value).catch((err) => showToast("自动休眠服务未响应：" + (err.message || String(err)), true));
+  const seconds = normalizeAutoSleepSeconds(ev.target.value, 0);
+  applyDisplaySettingsNow({
+    auto_sleep_enabled: seconds > 0,
+    auto_sleep_seconds: seconds > 0 ? seconds : DEFAULT_AUTO_SLEEP_SECONDS
+  }).catch((err) => showToast(err.message || String(err), true));
 });
 qs("#installAppBtn").addEventListener("click", openAppManageView);
 qs("#openServiceManageBtn").addEventListener("click", () => openAppManageView("service"));
@@ -6942,7 +6967,9 @@ qs("#wifiForm").addEventListener("submit", handleWifiSubmit);
 
 initAppManageView();
 loadStoredSettings();
-loadDeviceSettings();
+loadDeviceSettings().finally(() => {
+  loadDisplaySettingsControls().catch((err) => showToast(err.message || DISPLAY_SETTINGS_UNAVAILABLE_ERROR, true));
+});
 renderMediaLibrary();
 setWifiPasswordVisibility(false);
 loadMediaLibrary({ silent: true });

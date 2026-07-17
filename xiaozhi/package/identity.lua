@@ -1,9 +1,9 @@
 local M = {}
 
-local DEFAULT_MAC = "02:00:00:00:00:01"
 local DEFAULT_BOARD_TYPE = "bread-compact-wifi-lcd"
 local DEFAULT_BOARD_NAME = "bread-compact-wifi-lcd"
 local DEFAULT_FW_VERSION = "1.7.5"
+local cached_mac = nil
 
 local function json_escape(text)
   text = tostring(text or "")
@@ -20,6 +20,9 @@ local function normalize_mac(text)
     return nil
   end
   hex = hex:sub(1, 12)
+  if hex == "000000000000" or hex == "ffffffffffff" then
+    return nil
+  end
   local out = {}
   for i = 1, 12, 2 do
     out[#out + 1] = hex:sub(i, i + 1)
@@ -28,12 +31,16 @@ local function normalize_mac(text)
 end
 
 function M.device_id()
+  if cached_mac then
+    return cached_mac
+  end
   if wifi and wifi.sta and wifi.sta.getmac then
     local ok, mac = pcall(wifi.sta.getmac)
     if ok then
       mac = normalize_mac(mac)
       if mac then
-        return mac
+        cached_mac = mac
+        return cached_mac
       end
     end
   end
@@ -42,15 +49,19 @@ function M.device_id()
     if ok then
       mac = normalize_mac(mac)
       if mac then
-        return mac
+        cached_mac = mac
+        return cached_mac
       end
     end
   end
-  return DEFAULT_MAC
+  return nil
 end
 
 function M.client_id(mac)
-  mac = normalize_mac(mac or M.device_id()) or DEFAULT_MAC
+  mac = normalize_mac(mac or M.device_id())
+  if not mac then
+    return nil
+  end
   local hex = mac:gsub(":", "")
   return "00000000-0000-4000-8000-" .. hex
 end
@@ -73,10 +84,14 @@ end
 
 function M.http_headers(cfg)
   local mac = M.device_id()
+  local client_id = M.client_id(mac)
+  if not mac or not client_id then
+    return nil, "device mac unavailable"
+  end
   return {
     ["Activation-Version"] = "1",
     ["Device-Id"] = mac,
-    ["Client-Id"] = M.client_id(mac),
+    ["Client-Id"] = client_id,
     ["User-Agent"] = M.user_agent(cfg),
     ["Accept-Language"] = "zh-CN",
     ["Content-Type"] = "application/json",
@@ -85,6 +100,10 @@ end
 
 function M.system_info(cfg)
   local mac = M.device_id()
+  local client_id = M.client_id(mac)
+  if not mac or not client_id then
+    return nil, "device mac unavailable"
+  end
   local usage = nil
   if sys and sys.usage then
     local ok, data = pcall(sys.usage)
@@ -99,7 +118,7 @@ function M.system_info(cfg)
     flash_size = tonumber((cfg and cfg.FLASH_SIZE) or 16777216),
     minimum_free_heap_size = tostring((usage and usage.heap_free) or 123456),
     mac_address = mac,
-    uuid = M.client_id(mac),
+    uuid = client_id,
     chip_model_name = "esp32s3",
     chip_info = {
       model = 9,
@@ -140,15 +159,19 @@ function M.system_info(cfg)
 end
 
 function M.system_info_json(cfg)
+  local info, info_err = M.system_info(cfg)
+  if not info then
+    return nil, info_err
+  end
   if sjson and sjson.encode then
-    local ok, text = pcall(sjson.encode, M.system_info(cfg))
+    local ok, text = pcall(sjson.encode, info)
     if ok and type(text) == "string" then
       return text
     end
   end
 
-  local mac = M.device_id()
-  local uuid = M.client_id(mac)
+  local mac = info.mac_address
+  local uuid = info.uuid
   local board_type = json_escape(M.board_type(cfg))
   local board_name = json_escape(M.board_name(cfg))
   local fw = json_escape(M.firmware_version(cfg))

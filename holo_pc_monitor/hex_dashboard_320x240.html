@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=320,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Holo PC Monitor · Hex Layout</title>
+<style>
+*{box-sizing:border-box}html,body{width:320px;height:240px;margin:0;overflow:hidden;background:#020304}
+body{font-family:Arial,"Microsoft YaHei",sans-serif;color:#f4f7f8}
+#screen{position:absolute;left:0;top:0;width:320px;height:240px;overflow:hidden;background:radial-gradient(circle at 42% 48%,#101315 0,#07090a 38%,#020304 76%)}
+.topbar{position:absolute;left:0;top:0;width:320px;height:27px;border-bottom:1px solid #161a1c;white-space:nowrap}
+.time{position:absolute;left:12px;top:5px;width:60px;height:17px;color:#f5f7f8;font-size:14px;font-weight:600;line-height:17px;letter-spacing:.25px}
+.weather{position:absolute;left:91px;top:5px;width:138px;height:17px;display:flex;align-items:center;justify-content:center;gap:5px;color:#f5f7f8;font-size:8px;font-weight:600;line-height:17px;white-space:nowrap;overflow:hidden}
+.weather svg{flex:0 0 15px;width:15px;height:12px;fill:none;stroke:#e8c21d;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
+.date{position:absolute;right:9px;top:6px;width:76px;height:15px;color:#d7dcdf;font-size:8px;font-weight:700;line-height:15px;letter-spacing:.35px;text-align:right}
+.hive{position:absolute;left:24px;top:29px;width:174px;height:166px}
+.hex{position:absolute;width:62px;height:54px;background:#8b7415;clip-path:polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%)}
+.hex:before{content:"";position:absolute;left:1px;top:1px;width:60px;height:52px;background:linear-gradient(145deg,#15191a,#080a0b 78%);clip-path:inherit}
+.hex.active{background:#ffda24;filter:drop-shadow(0 0 5px rgba(255,208,30,.28))}.hex.active:before{background:linear-gradient(145deg,#ffd92a,#d8aa05)}
+.hex-content{position:absolute;z-index:1;left:6px;right:6px;top:11px;text-align:center;white-space:nowrap}
+.hex-label{display:block;color:#c7a918;font-size:6px;font-weight:700;line-height:9px;letter-spacing:.35px}.hex-value{display:block;margin-top:1px;color:#f5f7f8;font-size:10px;font-weight:800;line-height:13px}.hex-value small{font-size:6px;font-weight:700;margin-left:1px}
+.active .hex-label{color:#7b6200}.active .hex-value{color:#151300}
+.h-power{left:56px;top:0}.h-cpu{left:16px;top:27px}.h-gpu{left:56px;top:54px}.h-ram{left:96px;top:27px}.h-temp{left:16px;top:81px}.h-vram{left:56px;top:108px}.h-net{left:96px;top:81px}
+.edge{position:absolute;height:1px;background:#b99c16;opacity:.95;box-shadow:0 0 3px rgba(255,210,30,.28)}
+.e1{left:26px;top:29px;width:30px}.e2{left:118px;top:29px;width:30px}.e3{left:2px;top:110px;width:15px}.e4{left:158px;top:110px;width:15px}.edge:after{content:"";position:absolute;right:0;top:-2px;width:2px;height:5px;background:#b99c16}
+.detail{position:absolute;left:205px;top:38px;width:108px;height:157px}
+.kicker{position:absolute;left:0;top:0;color:#a68d19;font-size:6px;line-height:8px;letter-spacing:.45px;white-space:nowrap}
+.gpu-name{position:absolute;left:0;top:15px;width:108px;color:#f9fafb;font-size:13px;font-weight:800;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:clip}
+.gpu-clock{position:absolute;left:0;top:37px;color:#e7c21d;font-size:7px;font-weight:700;line-height:9px;white-space:nowrap}
+.metric{position:absolute;left:0;width:108px;height:31px;border-top:1px solid #514812}
+.metric.cpu{top:66px}.metric.mem{top:99px}.metric .name{position:absolute;left:0;top:8px;color:#f0cc20;font-size:6px;font-weight:700;line-height:8px}.metric .value{position:absolute;left:19px;right:0;top:8px;color:#b9c0c4;font-size:6px;line-height:8px;white-space:nowrap}.metric .value b{color:#f5f7f8;font-weight:700}
+.nodes{position:absolute;left:2px;bottom:0;color:#c9aa18;font-size:6px;line-height:8px;white-space:nowrap}.alerts{position:absolute;left:55px;bottom:0;color:#c9aa18;font-size:6px;line-height:8px;white-space:nowrap}
+.footer{position:absolute;left:9px;right:9px;bottom:9px;height:9px;color:#6c757b;font-size:6px;line-height:9px;letter-spacing:.25px;white-space:nowrap}
+.footer .status{color:#24d1ea}.footer .uptime{position:absolute;right:0;color:#b69b1b}
+</style>
+</head>
+<body>
+<main id="screen">
+  <header class="topbar">
+    <div class="time" id="time">14:28</div>
+    <div class="weather"><svg viewBox="0 0 24 18" aria-hidden="true"><circle cx="8" cy="7" r="3"/><path d="M8 1V0m0 14v2M2 7H0m14 0h2M3.7 2.7 2.3 1.3m10 10 1.4 1.4M12.3 2.7l1.4-1.4"/><path d="M8 15h10a4 4 0 0 0 .3-8A5.5 5.5 0 0 0 8 9.2 3 3 0 0 0 8 15Z"/></svg><span>上海 · 晴 · 26°C</span></div>
+    <div class="date" id="date">JUL 17 · FRI</div>
+  </header>
+  <section class="hive" aria-label="硬件蜂窝监控">
+    <i class="edge e1"></i><i class="edge e2"></i><i class="edge e3"></i><i class="edge e4"></i>
+    <div class="hex h-power"><div class="hex-content"><span class="hex-label">PWR</span><span class="hex-value">126<small>W</small></span></div></div>
+    <div class="hex h-cpu"><div class="hex-content"><span class="hex-label">CPU</span><span class="hex-value">38<small>%</small></span></div></div>
+    <div class="hex h-gpu active"><div class="hex-content"><span class="hex-label">GPU</span><span class="hex-value">72<small>%</small></span></div></div>
+    <div class="hex h-ram"><div class="hex-content"><span class="hex-label">RAM</span><span class="hex-value">41<small>%</small></span></div></div>
+    <div class="hex h-temp"><div class="hex-content"><span class="hex-label">TEMP</span><span class="hex-value">71<small>°</small></span></div></div>
+    <div class="hex h-vram"><div class="hex-content"><span class="hex-label">VRAM</span><span class="hex-value">7.8<small>G</small></span></div></div>
+    <div class="hex h-net"><div class="hex-content"><span class="hex-label">NET</span><span class="hex-value">84<small>M</small></span></div></div>
+  </section>
+  <aside class="detail">
+    <div class="kicker">ACTIVE NODE</div><div class="gpu-name">RTX 4080 S</div><div class="gpu-clock">2.76 GHz · 71°C</div>
+    <div class="metric cpu"><span class="name">CPU</span><span class="value"><b>i9-14900K</b> / 5.42G</span></div>
+    <div class="metric mem"><span class="name">MEM</span><span class="value"><b>26.2</b> / 64 GB</span></div>
+    <span class="nodes">7 NODES</span><span class="alerts">0 ALERTS</span>
+  </aside>
+  <div class="footer"><span class="status">● STREAM ONLINE</span><span class="uptime">UP 06:42</span></div>
+</main>
+<script>
+function updateClock(){const d=new Date(),pad=n=>String(n).padStart(2,"0"),months=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"],days=["SUN","MON","TUE","WED","THU","FRI","SAT"];document.getElementById("time").textContent=pad(d.getHours())+":"+pad(d.getMinutes());document.getElementById("date").textContent=months[d.getMonth()]+" "+pad(d.getDate())+" · "+days[d.getDay()]}
+updateClock();setInterval(updateClock,1000);
+</script>
+</body>
+</html>

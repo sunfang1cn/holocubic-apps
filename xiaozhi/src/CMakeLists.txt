@@ -52,6 +52,11 @@ project(xiaozhi)
 
 idf_build_get_property(xz_build_dir BUILD_DIR)
 idf_component_get_property(xz_opus_dir 78__esp-opus COMPONENT_DIR)
+execute_process(
+    COMMAND ${CMAKE_C_COMPILER} -print-libgcc-file-name
+    OUTPUT_VARIABLE XZ_LIBGCC
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
 
 set(xz_so_include_dirs
     "${MODULE_ABI_DIR}"
@@ -89,12 +94,12 @@ foreach(xz_so_include_dir IN LISTS xz_so_include_dirs)
     idf_build_set_property(COMPILE_INCLUDE_DIRECTORIES "${xz_so_include_dir}" APPEND)
 endforeach()
 
-idf_build_set_property(COMPILE_DEFINITIONS "HAVE_ALLOCA_H" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "HAVE_LRINT" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "HAVE_LRINTF" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "FIXED_POINT=1" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "DISABLE_FLOAT_API" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "HAVE_MEMORY_H" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "HAVE_ALLOCA_H" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "USE_ALLOCA" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "OPUS_BUILD" APPEND)
 if(IDF_TARGET STREQUAL "esp32s2" OR IDF_TARGET STREQUAL "esp32s3")
@@ -236,7 +241,8 @@ endforeach()
 # Keep Opus inside xiaozhi.so, but list only the official component sources.
 # project_so() recursively gathers every .c for ELF_COMPONENTS, which would
 # accidentally pull Opus demo/test/DNN sources.
-set(ELF_LIBS ${xz_opus_sources})
+set(ELF_LIBS ${xz_opus_sources} "${XZ_LIBGCC}")
+set(ELF_SO_COMPILE_FLAGS -Os)
 set(ELF_SO_LINK_FLAGS
     "-Wl,-Bsymbolic"
     "-Wl,--exclude-libs,ALL"

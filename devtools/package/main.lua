@@ -2017,18 +2017,32 @@ async function uploadOneFile(task, baseDir){
   const file = task.file;
   const relativePath = task.relativePath;
   const queue = addQueueItem(relativePath);
-  let offset = 0;
   try{
-    while(offset < file.size || (file.size === 0 && offset === 0)){
-      const end = Math.min(offset + serverInfo.chunk_size, file.size);
-      const res = await fetch(apiUrl("/api/upload", {path:joinPath(baseDir, relativePath), offset, total:file.size}), {method:"PUT", body:file.slice(offset, end)});
-      const data = await parseJson(res);
-      offset = Number(data.next_offset || end);
-      const pct = file.size > 0 ? Math.min(100, Math.round(offset * 100 / file.size)) : 100;
-      queue.bar.style.width = pct + "%";
-      queue.status.textContent = pct + "%";
-      if(file.size === 0) break;
-    }
+    const path = joinPath(baseDir, relativePath);
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", "/api/system/fs/upload?path=" + encodeURIComponent(path));
+      xhr.upload.onprogress = ev => {
+        const loaded = ev.lengthComputable ? ev.loaded : 0;
+        const pct = file.size > 0 ? Math.min(100, Math.round(loaded * 100 / file.size)) : 100;
+        queue.bar.style.width = pct + "%";
+        queue.status.textContent = pct + "%";
+      };
+      xhr.onload = () => {
+        let data = {};
+        try{data = xhr.responseText ? JSON.parse(xhr.responseText) : {}}
+        catch(_){reject(new Error(xhr.responseText || xhr.statusText || "JSON parse failed"));return}
+        if(xhr.status < 200 || xhr.status >= 300 || data.ok === false){
+          reject(new Error(data.error || xhr.statusText || "upload failed"));
+          return;
+        }
+        resolve(data);
+      };
+      xhr.onerror = () => reject(new Error("upload failed"));
+      xhr.send(file);
+    });
+    queue.bar.style.width = "100%";
+    queue.status.textContent = "100%";
   }catch(err){
     queue.status.textContent = "失败";
     throw err;
@@ -2303,6 +2317,7 @@ APP.register_route(httpd.POST, APP.API_PREFIX .. "/reload", APP.api_reload)
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/code/save", APP.route_save_code)
 APP.register_route(httpd.POST, APP.API_PREFIX .. "/code/run", APP.route_run_code)
 
+-- Compatibility endpoint for existing clients. The WebUI uses the firmware FS fast path.
 APP.register_route(httpd.PUT, APP.API_PREFIX .. "/upload", APP.api_upload)
 
 APP.register_route(httpd.DELETE, APP.API_PREFIX .. "/remove", APP.api_remove)

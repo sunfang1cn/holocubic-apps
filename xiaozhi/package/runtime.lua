@@ -283,6 +283,10 @@ function M.new(cfg, load_module)
     local started = self.activation:start(function(event, data)
       if event == "need_config" then
         self.ui:set_chat_message("system", data or "未配置 ota.url")
+      elseif event == "waiting_mac" then
+        set_state(State.ACTIVATING)
+        self.ui:set_status("等待设备 MAC")
+        self.ui:set_chat_message("system", "正在读取设备 MAC")
       elseif event == "checking" then
         set_state(State.ACTIVATING)
         self.ui:set_status("检查 OTA")
@@ -440,6 +444,11 @@ function M.new(cfg, load_module)
       pcall(function() self.timer:stop() end)
       pcall(function() self.timer:unregister() end)
       self.timer = nil
+    end
+    if self.controller_exit_timer then
+      pcall(function() self.controller_exit_timer:stop() end)
+      pcall(function() self.controller_exit_timer:unregister() end)
+      self.controller_exit_timer = nil
     end
     if self.wake_open_timer then
       pcall(function() self.wake_open_timer:stop() end)

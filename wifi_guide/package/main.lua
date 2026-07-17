@@ -12,6 +12,7 @@ lv_obj_clean(root)
 local UI = { setup = {}, success = {} }
 local STATE = {
   poll_timer = nil,
+  controller_timer = nil,
   font_handles = {},
   language = "en",
   connected = false,
@@ -652,9 +653,22 @@ end
 
 local function leave_app()
   stop_timer("poll_timer")
+  stop_timer("controller_timer")
   release_fonts()
   pcall(function() key.off() end)
   if app and app.exit then pcall(function() app.exit() end) end
+end
+
+if controller and controller.state and tmr and tmr.create then
+  local controller_buttons = 0
+  STATE.controller_timer = tmr.create()
+  STATE.controller_timer:alarm(40, tmr.ALARM_AUTO, function()
+    local ok, pad = pcall(function() return controller.state("ble-main") end)
+    local buttons = ok and type(pad) == "table" and (tonumber(pad.buttons) or 0) or 0
+    local pressed = buttons & (~controller_buttons)
+    controller_buttons = buttons
+    if (pressed & (4096 | 32768)) ~= 0 then leave_app() end
+  end)
 end
 
 STATE.language = selected_language()
